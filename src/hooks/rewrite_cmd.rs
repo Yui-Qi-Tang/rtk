@@ -29,6 +29,14 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
 
     match registry::rewrite_command(cmd, &excluded, &transparent_prefixes) {
         Some(rewritten) => match verdict {
+            PermissionVerdict::Allow if is_shell_exec_subcommand(&rewritten) => {
+                // Never auto-allow rtk subcommands that execute an arbitrary
+                // shell-style command (err/test/summary/proxy/sh): force a human
+                // confirmation even if an allow rule matched (#640 B-1).
+                print!("{}", rewritten);
+                let _ = std::io::stdout().flush();
+                std::process::exit(3);
+            }
             PermissionVerdict::Allow => {
                 print!("{}", rewritten);
                 let _ = std::io::stdout().flush();
@@ -49,12 +57,29 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
     }
 }
 
+/// True if the rewritten command is an rtk subcommand that runs an arbitrary
+/// shell-style command and must therefore never be auto-allowed (#640 B-1).
+fn is_shell_exec_subcommand(rewritten: &str) -> bool {
+    let rest = rewritten.strip_prefix("rtk ").unwrap_or(rewritten);
+    let verb = rest.split_whitespace().next().unwrap_or("");
+    matches!(verb, "err" | "test" | "summary" | "proxy" | "sh")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rewrite_command_no_prefixes(cmd: &str) -> Option<String> {
         registry::rewrite_command(cmd, &[], &[])
+    }
+
+    #[test]
+    fn test_is_shell_exec_subcommand() {
+        assert!(is_shell_exec_subcommand("rtk test cargo test"));
+        assert!(is_shell_exec_subcommand("rtk proxy curl https://x"));
+        assert!(is_shell_exec_subcommand("rtk sh 'echo hi'"));
+        assert!(!is_shell_exec_subcommand("rtk git status"));
+        assert!(!is_shell_exec_subcommand("rtk cargo test"));
     }
 
     #[test]

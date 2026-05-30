@@ -1513,6 +1513,14 @@ fn filter_s3_transfer(output: &str) -> FilterResult {
 }
 
 fn filter_secrets_get(json_str: &str) -> Option<FilterResult> {
+    // Redact secret material by default so it never lands in agent context,
+    // transcripts, or the tracking DB (#1875/#1986). Opt in to the raw value
+    // with RTK_AWS_SHOW_SECRETS=1.
+    let reveal = std::env::var("RTK_AWS_SHOW_SECRETS").as_deref() == Ok("1");
+    filter_secrets_get_impl(json_str, reveal)
+}
+
+fn filter_secrets_get_impl(json_str: &str, reveal: bool) -> Option<FilterResult> {
     let v: Value = serde_json::from_str(json_str).ok()?;
 
     let mut lines = Vec::new();
@@ -1524,13 +1532,17 @@ fn filter_secrets_get(json_str: &str) -> Option<FilterResult> {
 
     // Extract SecretString
     if let Some(secret_str) = v["SecretString"].as_str() {
-        // Try to parse as JSON and compact it
-        if let Ok(secret_json) = serde_json::from_str::<Value>(secret_str) {
-            let compact =
-                serde_json::to_string(&secret_json).unwrap_or_else(|_| secret_str.to_string());
-            lines.push(format!("Secret: {}", compact));
+        if reveal {
+            // Explicit opt-in: try to parse as JSON and compact it.
+            if let Ok(secret_json) = serde_json::from_str::<Value>(secret_str) {
+                let compact =
+                    serde_json::to_string(&secret_json).unwrap_or_else(|_| secret_str.to_string());
+                lines.push(format!("Secret: {}", compact));
+            } else {
+                lines.push(format!("Secret: {}", secret_str));
+            }
         } else {
-            lines.push(format!("Secret: {}", secret_str));
+            lines.push(redact_secret_string(secret_str));
         }
     }
 
@@ -1539,6 +1551,29 @@ fn filter_secrets_get(json_str: &str) -> Option<FilterResult> {
     }
 
     Some(FilterResult::new(lines.join("\n")))
+}
+
+/// Describe a secret without revealing its value. For JSON secrets, lists the
+/// key names only (useful metadata, no values); for opaque strings, reports the
+/// length. Always appends how to reveal the real value.
+fn redact_secret_string(secret_str: &str) -> String {
+    const HINT: &str = "set RTK_AWS_SHOW_SECRETS=1 to reveal";
+    match serde_json::from_str::<Value>(secret_str) {
+        Ok(Value::Object(map)) => {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            format!(
+                "Secret: [redacted JSON, {} keys: {} — {}]",
+                keys.len(),
+                keys.join(", "),
+                HINT
+            )
+        }
+        _ => format!(
+            "Secret: [redacted {} chars — {}]",
+            secret_str.chars().count(),
+            HINT
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -2493,7 +2528,7 @@ upload: file10.txt to s3://bucket/file10.txt
     }
 
     #[test]
-    fn test_filter_secrets_get() {
+    fn test_filter_secrets_get_redacts_by_default() {
         let json = r#"{
             "Name": "my-secret",
             "SecretString": "{\"username\":\"admin\",\"password\":\"secret123\"}",
@@ -2501,23 +2536,58 @@ upload: file10.txt to s3://bucket/file10.txt
             "VersionId": "version-uuid",
             "CreatedDate": "2024-01-01T00:00:00Z"
         }"#;
-        let result = filter_secrets_get(json).unwrap();
+        // reveal = false (default): secret VALUES must never appear.
+        let result = filter_secrets_get_impl(json, false).unwrap();
         assert!(result.text.contains("Name: my-secret"));
-        assert!(result
-            .text
-            .contains(r#"{"username":"admin","password":"secret123"}"#));
+        assert!(
+            !result.text.contains("secret123"),
+            "secret value must be redacted: {}",
+            result.text
+        );
+        // Key names are safe metadata and remain useful.
+        assert!(result.text.contains("username"));
+        assert!(result.text.contains("password"));
+        assert!(result.text.contains("RTK_AWS_SHOW_SECRETS=1"));
         assert!(!result.text.contains("ARN"));
         assert!(!result.text.contains("VersionId"));
     }
 
     #[test]
-    fn test_filter_secrets_get_plain_text() {
+    fn test_filter_secrets_get_reveal_opt_in() {
+        let json = r#"{
+            "Name": "my-secret",
+            "SecretString": "{\"username\":\"admin\",\"password\":\"secret123\"}"
+        }"#;
+        // reveal = true (explicit opt-in): original behavior, value shown.
+        let result = filter_secrets_get_impl(json, true).unwrap();
+        assert!(result
+            .text
+            .contains(r#"{"username":"admin","password":"secret123"}"#));
+    }
+
+    #[test]
+    fn test_filter_secrets_get_plain_text_redacted() {
         let json = r#"{
             "Name": "my-secret",
             "SecretString": "plain-text-password"
         }"#;
-        let result = filter_secrets_get(json).unwrap();
+        let result = filter_secrets_get_impl(json, false).unwrap();
         assert!(result.text.contains("Name: my-secret"));
+        assert!(
+            !result.text.contains("plain-text-password"),
+            "opaque secret must be redacted: {}",
+            result.text
+        );
+        assert!(result.text.contains("redacted 19 chars"));
+    }
+
+    #[test]
+    fn test_filter_secrets_get_plain_text_reveal() {
+        let json = r#"{
+            "Name": "my-secret",
+            "SecretString": "plain-text-password"
+        }"#;
+        let result = filter_secrets_get_impl(json, true).unwrap();
         assert!(result.text.contains("Secret: plain-text-password"));
     }
 

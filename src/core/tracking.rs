@@ -31,6 +31,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use lazy_static::lazy_static;
+use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::ffi::OsString;
@@ -247,12 +249,24 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new() -> Result<Self> {
-        let db_path = get_db_path()?;
+        Self::open_at(get_db_path()?)
+    }
+
+    /// Open (creating if needed) a tracker at an explicit DB path.
+    ///
+    /// Shared by [`new`](Self::new) and the test-only [`new_at`](Self::new_at)
+    /// so permission hardening and schema setup live in one place.
+    fn open_at(db_path: PathBuf) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Privacy hardening (#1790/#1160): the tracking DB holds full command
+            // history and project paths. Restrict the data dir to owner-only so
+            // WAL/SHM sidecars are also protected, regardless of the file umask.
+            crate::core::utils::restrict_permissions(parent, 0o700);
         }
 
         let conn = Connection::open(&db_path)?;
+        crate::core::utils::restrict_permissions(&db_path, 0o600);
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
         let _ = conn.execute_batch(
@@ -324,6 +338,15 @@ impl Tracker {
         )?;
 
         Ok(Self { conn })
+    }
+
+    /// Open a tracker at an explicit on-disk path (tests only).
+    ///
+    /// Lets permission tests inject a temp path without mutating the global
+    /// `RTK_DB_PATH` env var (which would race other tests).
+    #[cfg(test)]
+    pub fn new_at(path: &std::path::Path) -> Result<Self> {
+        Self::open_at(path.to_path_buf())
     }
 
     /// Create an isolated in-memory tracker for tests.
@@ -415,6 +438,11 @@ impl Tracker {
         };
 
         let project_path = current_project_path_string(); // added: record cwd
+
+        // Redact likely-secret values before persisting (#640 E-1/E-2): the DB
+        // is retained 90 days and replayed to the LLM via `rtk gain --history`.
+        let original_cmd = redact_sensitive_args(original_cmd);
+        let rtk_cmd = redact_sensitive_args(rtk_cmd);
 
         self.conn.execute(
             "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
@@ -1257,9 +1285,23 @@ pub struct ParseFailureSummary {
 /// Record a parse failure without ever crashing.
 /// Silently ignores all errors — used in the fallback path.
 pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succeeded: bool) {
+    if !is_tracking_enabled() {
+        return;
+    }
     if let Ok(tracker) = Tracker::new() {
         let _ = tracker.record_parse_failure(raw_command, error_message, succeeded);
     }
+}
+
+/// Whether command-history tracking writes are enabled.
+///
+/// Honors `[tracking] enabled = false` in config.toml (#1875). On any config
+/// load error, defaults to `true` to preserve existing behavior — tracking is
+/// the default and a missing/unreadable config must not silently disable it.
+pub fn is_tracking_enabled() -> bool {
+    crate::core::config::Config::load()
+        .map(|c| c.tracking.enabled)
+        .unwrap_or(true)
 }
 
 /// Estimate token count from text using ~4 chars = 1 token heuristic.
@@ -1354,6 +1396,23 @@ impl TimedExecution {
     /// timer.track("ls -la", "rtk ls", input, output);
     /// ```
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
+        self.track_with(original_cmd, rtk_cmd, input, output, is_tracking_enabled());
+    }
+
+    /// Inner implementation with the tracking-enabled decision injected, so the
+    /// `[tracking] enabled = false` gate (#1875) can be tested deterministically.
+    /// Returns `true` if a record was attempted, `false` if tracking was gated off.
+    fn track_with(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input: &str,
+        output: &str,
+        enabled: bool,
+    ) -> bool {
+        if !enabled {
+            return false;
+        }
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
@@ -1367,6 +1426,7 @@ impl TimedExecution {
                 elapsed_ms,
             );
         }
+        true
     }
 
     /// Track passthrough commands (timing-only, no token counting).
@@ -1390,12 +1450,61 @@ impl TimedExecution {
     /// timer.track_passthrough("git tag", "rtk git tag");
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
+        if !is_tracking_enabled() {
+            return;
+        }
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         // input_tokens=0, output_tokens=0 won't dilute savings statistics
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
         }
     }
+}
+
+/// Redact likely-secret values from a command string before persistence (#640
+/// E-1/E-2). Best-effort denylist hardened against a red-team pass: credential
+/// flags (long flags + glued short `-phunter2` + `-u user:pass`), any
+/// `Authorization:`/secret-header value, sensitive `KEY=value` env, secret JSON
+/// keys, and inline URL credentials. Cannot catch arbitrarily-named secrets
+/// (e.g. `STRIPE_SK=…`) — see RED_BLUE.md. Never panics.
+pub fn redact_sensitive_args(cmd: &str) -> String {
+    lazy_static! {
+        // Long flags: --password X / --token=X / ...
+        static ref FLAG_RE: Regex = Regex::new(
+            r"(?i)(--?(?:password|passwd|token|secret|api[-_]?key|access[-_]?key|auth[-_]?token|client[-_]?secret))([=\s]+)(\S+)"
+        ).unwrap();
+        // Glued short password flags: -phunter2 / -Wsecret (value attached).
+        static ref SHORT_GLUED_RE: Regex = Regex::new(r"(\s-[pW])([^\s=-]\S*)").unwrap();
+        // curl-style user:password (-u user:pass).
+        static ref USERPASS_RE: Regex = Regex::new(r"(\s-u\s+[^\s:]+:)(\S+)").unwrap();
+        // Any Authorization scheme (Bearer/Basic/ApiKey/Digest/…) or bare token.
+        static ref AUTH_RE: Regex =
+            Regex::new(r"(?i)(authorization:\s*)([a-z]+\s+)?([^\s'\x22]+)").unwrap();
+        // Other secret-bearing HTTP headers.
+        static ref HEADER_RE: Regex = Regex::new(
+            r#"(?i)((?:x-api-key|x-auth-token|x-amz-security-token|private-token|api-key|cookie|x-secret-token)\s*:\s*)([^\s'\x22]+)"#
+        ).unwrap();
+        // Sensitive env assignments. Adds pwd/pass/passphrase over the original.
+        static ref ENV_RE: Regex = Regex::new(
+            r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|passphrase|pwd|pass|token|secret|api[_-]?key|access[_-]?key|credential|private[_-]?key)[A-Za-z0-9_]*)=(\S+)"
+        ).unwrap();
+        // Secret keys inside JSON/dict bodies: "password": "x".
+        static ref JSON_RE: Regex = Regex::new(
+            r#"(?i)("(?:password|passwd|pwd|pass|passphrase|token|secret|api[_-]?key|access[_-]?key|credential|client[_-]?secret)"\s*:\s*")([^"]*)(")"#
+        ).unwrap();
+        // Inline URL credentials, including empty username (redis://:pass@).
+        static ref URL_RE: Regex =
+            Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]*):([^@/\s]+)@").unwrap();
+    }
+    let s = FLAG_RE.replace_all(cmd, "${1}${2}***");
+    let s = SHORT_GLUED_RE.replace_all(&s, "${1}***");
+    let s = USERPASS_RE.replace_all(&s, "${1}***");
+    let s = AUTH_RE.replace_all(&s, "${1}${2}***");
+    let s = HEADER_RE.replace_all(&s, "${1}***");
+    let s = ENV_RE.replace_all(&s, "${1}=***");
+    let s = JSON_RE.replace_all(&s, "${1}***${3}");
+    let s = URL_RE.replace_all(&s, "${1}:***@");
+    s.into_owned()
 }
 
 /// Format OsString args for tracking display.
@@ -1566,6 +1675,154 @@ mod tests {
             "expected default path ending with rtk/history.db, got: {}",
             db_path.display()
         );
+    }
+
+    // Privacy hardening (#1790/#1160): opening a tracker must restrict the DB
+    // file and its parent dir to owner-only on Unix. Uses new_at to avoid
+    // mutating the global RTK_DB_PATH env var (which would race other tests).
+    #[cfg(unix)]
+    #[test]
+    fn test_new_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("data").join("history.db");
+
+        let _tracker = Tracker::new_at(&db_path).expect("Tracker::new_at should succeed");
+
+        let file_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "tracking DB should be owner-only (0600)");
+        let dir_mode = std::fs::metadata(db_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "tracking dir should be owner-only (0700)");
+    }
+
+    // tracking.enabled = false is enforced (#1875 finding 3): track_with(false)
+    // must not attempt a record; track_with(true) must. The bool return makes
+    // the gate observable without touching the global DB / env.
+    #[test]
+    fn test_track_respects_enabled_flag() {
+        let timer = TimedExecution::start();
+        assert!(
+            !timer.track_with(
+                "git status",
+                "rtk git status",
+                "long output here",
+                "short",
+                false
+            ),
+            "disabled tracking must not record"
+        );
+        assert!(
+            timer.track_with(
+                "git status",
+                "rtk git status",
+                "long output here",
+                "short",
+                true
+            ),
+            "enabled tracking must record"
+        );
+    }
+
+    // is_tracking_enabled defaults to true when no config file is present.
+    #[test]
+    fn test_is_tracking_enabled_defaults_true() {
+        assert!(is_tracking_enabled());
+    }
+
+    // Sensitive-arg redaction (#640 E-1/E-2).
+    #[test]
+    fn test_redact_sensitive_args() {
+        let r = redact_sensitive_args("psql --password hunter2 -h db");
+        assert!(!r.contains("hunter2"), "got: {r}");
+        assert!(r.contains("--password ***"), "got: {r}");
+
+        let r = redact_sensitive_args("mytool --token=abc.def.ghi run");
+        assert!(!r.contains("abc.def.ghi"), "got: {r}");
+
+        let r = redact_sensitive_args("curl -H 'Authorization: Bearer sk-secret123' https://api");
+        assert!(!r.contains("sk-secret123"), "got: {r}");
+
+        let r = redact_sensitive_args("GITHUB_TOKEN=ghp_deadbeef gh pr list");
+        assert!(!r.contains("ghp_deadbeef"), "got: {r}");
+        assert!(r.contains("GITHUB_TOKEN=***"), "got: {r}");
+
+        let r = redact_sensitive_args("git clone https://user:p4ss@github.com/o/r.git");
+        assert!(!r.contains("p4ss"), "got: {r}");
+
+        // Non-sensitive command is unchanged.
+        assert_eq!(redact_sensitive_args("git status -s"), "git status -s");
+    }
+
+    // Red-team regression corpus (#640 E-1): each secret must be gone.
+    #[test]
+    fn test_redact_sensitive_args_redteam_corpus() {
+        let cases = [
+            // glued + spaced short flags
+            ("mysql -phunter2 db", "hunter2"),
+            ("mysqldump -pMyP4ss dbname", "MyP4ss"),
+            ("curl -u admin:s3cret http://x", "s3cret"),
+            // env var name gaps
+            ("MYSQL_PWD=hunter2 mysql", "hunter2"),
+            ("DB_PASS=hunter2 app", "hunter2"),
+            ("PASSPHRASE=abc gpg", "abc"),
+            // non-Authorization headers
+            ("curl -H 'X-Api-Key: SEKRET' http://x", "SEKRET"),
+            ("curl -H 'Cookie: session=SEKRET' http://x", "SEKRET"),
+            ("curl -H 'PRIVATE-TOKEN: SEKRET' http://x", "SEKRET"),
+            ("curl -H 'X-Auth-Token: SEKRET' http://x", "SEKRET"),
+            // auth schemes beyond bearer/basic/token
+            ("curl -H 'Authorization: ApiKey SEKRET' http://x", "SEKRET"),
+            ("curl -H 'Authorization: Digest SEKRET' http://x", "SEKRET"),
+            // JSON bodies
+            (r#"curl -d '{"password":"hunter2"}'"#, "hunter2"),
+            (r#"curl -d '{"api_key": "abc123"}'"#, "abc123"),
+            // URL userinfo with empty username
+            ("redis-cli -u redis://:p4ss@host:6379", "p4ss"),
+        ];
+        for (input, secret) in cases {
+            let out = redact_sensitive_args(input);
+            assert!(
+                !out.contains(secret),
+                "secret '{secret}' survived in: {out}  (input: {input})"
+            );
+        }
+    }
+
+    // Guard against over-redaction of common non-secret `-p` uses.
+    #[test]
+    fn test_redact_does_not_over_redact_plain_p_flag() {
+        assert_eq!(
+            redact_sensitive_args("mkdir -p /tmp/foo/bar"),
+            "mkdir -p /tmp/foo/bar"
+        );
+        assert_eq!(
+            redact_sensitive_args("docker run -p 8080:80 img"),
+            "docker run -p 8080:80 img"
+        );
+    }
+
+    // record() must persist the REDACTED command, not the raw secret.
+    #[test]
+    fn test_record_redacts_before_storage() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        tracker
+            .record(
+                "psql --password hunter2",
+                "rtk proxy psql --password hunter2",
+                100,
+                20,
+                5,
+            )
+            .expect("record");
+        let recent = tracker.get_recent(5).expect("recent");
+        let row = recent.first().expect("one row");
+        assert!(!row.rtk_cmd.contains("hunter2"), "rtk: {}", row.rtk_cmd);
+        assert!(row.rtk_cmd.contains("***"), "rtk: {}", row.rtk_cmd);
     }
 
     // 9. project_filter_params uses GLOB pattern with * wildcard // added

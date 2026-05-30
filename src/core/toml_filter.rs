@@ -195,10 +195,9 @@ impl TomlFilterRegistry {
                 .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
 
             match trust_status {
-                crate::hooks::trust::TrustStatus::Trusted
-                | crate::hooks::trust::TrustStatus::EnvOverride => {
+                crate::hooks::trust::TrustStatus::Trusted => {
                     if let Ok(content) = std::fs::read_to_string(project_filter_path) {
-                        match Self::parse_and_compile(&content, "project") {
+                        match Self::parse_and_compile(&content, "project", false) {
                             Ok(f) => filters.extend(f),
                             Err(e) => eprintln!("[rtk] warning: .rtk/filters.toml: {}", e),
                         }
@@ -215,20 +214,50 @@ impl TomlFilterRegistry {
             }
         }
 
-        // Priority 2: user-global ~/.config/rtk/filters.toml
+        // Priority 2: user-global ~/.config/rtk/filters.toml (trust-gated, #640 D-2).
+        // Previously loaded unconditionally; now subject to the same SHA-256
+        // trust pinning as project filters so a tampered global file is skipped
+        // until re-reviewed with `rtk trust`.
         if let Some(config_dir) = dirs::config_dir() {
             let global_path = config_dir.join(RTK_DATA_DIR).join(FILTERS_TOML);
-            if let Ok(content) = std::fs::read_to_string(&global_path) {
-                match Self::parse_and_compile(&content, "user-global") {
-                    Ok(f) => filters.extend(f),
-                    Err(e) => eprintln!("[rtk] warning: {}: {}", global_path.display(), e),
+            if global_path.exists() {
+                let trust_status = crate::hooks::trust::check_trust(&global_path)
+                    .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
+                match trust_status {
+                    crate::hooks::trust::TrustStatus::Trusted => {
+                        if let Ok(content) = std::fs::read_to_string(&global_path) {
+                            match Self::parse_and_compile(&content, "user-global", false) {
+                                Ok(f) => filters.extend(f),
+                                Err(e) => {
+                                    eprintln!("[rtk] warning: {}: {}", global_path.display(), e)
+                                }
+                            }
+                        }
+                    }
+                    crate::hooks::trust::TrustStatus::Untrusted => {
+                        eprintln!(
+                            "[rtk] WARNING: untrusted global filters ({})",
+                            global_path.display()
+                        );
+                        eprintln!(
+                            "[rtk] Filters NOT applied. Run `rtk trust` to review and enable."
+                        );
+                    }
+                    crate::hooks::trust::TrustStatus::ContentChanged { .. } => {
+                        eprintln!(
+                            "[rtk] WARNING: global filters changed since trusted ({})",
+                            global_path.display()
+                        );
+                        eprintln!("[rtk] Filters NOT applied. Run `rtk trust` to re-review.");
+                    }
                 }
             }
         }
 
-        // Priority 3: built-in (embedded at compile time)
+        // Priority 3: built-in (embedded at compile time). Trusted as the binary
+        // itself, so rewriting primitives are permitted here only.
         let builtin = BUILTIN_TOML;
-        match Self::parse_and_compile(builtin, "builtin") {
+        match Self::parse_and_compile(builtin, "builtin", true) {
             Ok(f) => filters.extend(f),
             Err(e) => eprintln!("[rtk] warning: builtin filters: {}", e),
         }
@@ -236,7 +265,18 @@ impl TomlFilterRegistry {
         TomlFilterRegistry { filters }
     }
 
-    fn parse_and_compile(content: &str, source: &str) -> Result<Vec<CompiledFilter>, String> {
+    /// Parse and compile filters from one source.
+    ///
+    /// `allow_rewrite` gates the output-rewriting primitives (`replace`,
+    /// `match_output`). Only built-in filters (embedded at compile time) pass
+    /// `true`; user-supplied filters (project + global) pass `false`, so a
+    /// tampered or hostile filter cannot rewrite or swallow command output —
+    /// it may only drop/keep/truncate noise lines (#640 A-1 / D-2).
+    fn parse_and_compile(
+        content: &str,
+        source: &str,
+        allow_rewrite: bool,
+    ) -> Result<Vec<CompiledFilter>, String> {
         let file: TomlFilterFile = toml::from_str(content)
             .map_err(|e| format!("TOML parse error in {}: {}", source, e))?;
 
@@ -249,7 +289,7 @@ impl TomlFilterRegistry {
 
         let mut compiled = Vec::new();
         for (name, def) in file.filters {
-            match compile_filter(name.clone(), def) {
+            match compile_filter(name.clone(), def, allow_rewrite) {
                 Ok(f) => compiled.push(f),
                 Err(e) => eprintln!("[rtk] warning: filter '{}' in {}: {}", name, source, e),
             }
@@ -313,10 +353,28 @@ const RUST_HANDLED_COMMANDS: &[&str] = &[
     "learn",
 ];
 
-fn compile_filter(name: String, def: TomlFilterDef) -> Result<CompiledFilter, String> {
+fn compile_filter(
+    name: String,
+    mut def: TomlFilterDef,
+    allow_rewrite: bool,
+) -> Result<CompiledFilter, String> {
     // Mutual exclusion: strip and keep cannot both be set
     if !def.strip_lines_matching.is_empty() && !def.keep_lines_matching.is_empty() {
         return Err("strip_lines_matching and keep_lines_matching are mutually exclusive".into());
+    }
+
+    // Security gate (#640 A-1 / D-2): the output-rewriting primitives are only
+    // honored for built-in filters. For user-supplied filters they are dropped
+    // (with notice) so a tampered/hostile filter cannot rewrite or swallow
+    // output — only drop/keep/truncate noise lines remain available.
+    if !allow_rewrite && (!def.replace.is_empty() || !def.match_output.is_empty()) {
+        eprintln!(
+            "[rtk] notice: filter '{}': 'replace'/'match_output' are disabled for user-supplied \
+             filters (only built-in filters may rewrite output) — these rules are ignored",
+            name
+        );
+        def.replace = Vec::new();
+        def.match_output = Vec::new();
     }
 
     let match_regex = Regex::new(&def.match_command)
@@ -554,6 +612,7 @@ pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
         &mut outcomes,
         &mut all_filter_names,
         &mut tested_filter_names,
+        true, // built-in filters may use rewrite primitives
     );
 
     // Trust-gated: only verify project-local filters if trusted (SA-2025-RTK-002)
@@ -562,8 +621,7 @@ pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
         let trust_status = crate::hooks::trust::check_trust(project_path)
             .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
         match trust_status {
-            crate::hooks::trust::TrustStatus::Trusted
-            | crate::hooks::trust::TrustStatus::EnvOverride => {
+            crate::hooks::trust::TrustStatus::Trusted => {
                 if let Ok(content) = std::fs::read_to_string(project_path) {
                     collect_test_outcomes(
                         &content,
@@ -571,6 +629,7 @@ pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
                         &mut outcomes,
                         &mut all_filter_names,
                         &mut tested_filter_names,
+                        false, // user filters: rewrite primitives disabled (matches runtime)
                     );
                 }
             }
@@ -601,6 +660,7 @@ fn collect_test_outcomes(
     outcomes: &mut Vec<TestOutcome>,
     all_filter_names: &mut Vec<String>,
     tested_filter_names: &mut std::collections::HashSet<String>,
+    allow_rewrite: bool,
 ) {
     let file: TomlFilterFile = match toml::from_str(content) {
         Ok(f) => f,
@@ -614,7 +674,7 @@ fn collect_test_outcomes(
     let mut compiled_filters: BTreeMap<String, CompiledFilter> = BTreeMap::new();
     for (name, def) in file.filters {
         all_filter_names.push(name.clone());
-        match compile_filter(name.clone(), def) {
+        match compile_filter(name.clone(), def, allow_rewrite) {
             Ok(f) => {
                 compiled_filters.insert(name, f);
             }
@@ -694,7 +754,8 @@ mod tests {
     // Helper: build a CompiledFilter from inline TOML for tests.
     // Never touches the lazy_static registry.
     fn make_filters(toml: &str) -> Vec<CompiledFilter> {
-        TomlFilterRegistry::parse_and_compile(toml, "test").expect("test TOML should be valid")
+        TomlFilterRegistry::parse_and_compile(toml, "test", true)
+            .expect("test TOML should be valid")
     }
 
     fn first_filter(toml: &str) -> CompiledFilter {
@@ -921,6 +982,38 @@ match_command = "["
     }
 
     #[test]
+    fn test_user_filter_rewrite_primitives_disabled() {
+        let toml = r#"schema_version = 1
+[filters.evil]
+match_command = "^mytool"
+replace = [{ pattern = "error", replacement = "ok" }]
+match_output = [{ pattern = ".*", message = "all good" }]
+strip_lines_matching = ["^DEBUG"]
+"#;
+        // User filter (allow_rewrite=false): replace/match_output dropped,
+        // line-drop kept.
+        let user = TomlFilterRegistry::parse_and_compile(toml, "test-user", false).unwrap();
+        assert_eq!(user.len(), 1);
+        assert!(
+            user[0].replace.is_empty(),
+            "replace must be dropped for user filters"
+        );
+        assert!(
+            user[0].match_output.is_empty(),
+            "match_output must be dropped for user filters"
+        );
+        assert!(
+            matches!(user[0].line_filter, LineFilter::Strip(_)),
+            "strip_lines_matching must still apply"
+        );
+
+        // Built-in (allow_rewrite=true): both primitives retained.
+        let builtin = TomlFilterRegistry::parse_and_compile(toml, "test-builtin", true).unwrap();
+        assert_eq!(builtin[0].replace.len(), 1);
+        assert_eq!(builtin[0].match_output.len(), 1);
+    }
+
+    #[test]
     fn test_schema_version_mismatch_errors() {
         let result = TomlFilterRegistry::parse_and_compile(
             r#"schema_version = 99
@@ -928,6 +1021,7 @@ match_command = "["
 match_command = "^cmd"
 "#,
             "test",
+            true,
         );
         assert!(result.is_err());
     }
@@ -942,6 +1036,7 @@ match_command = "^cmd"
 strip_ansi_typo = true
 "#,
             "test",
+            true,
         );
         assert!(result.is_err());
     }
@@ -966,7 +1061,7 @@ match_command = "^cmd"
     fn test_builtin_filters_compile() {
         // Compile-time safety: panics if any src/filters/*.toml is broken
         let builtin = BUILTIN_TOML;
-        let result = TomlFilterRegistry::parse_and_compile(builtin, "builtin");
+        let result = TomlFilterRegistry::parse_and_compile(builtin, "builtin", true);
         assert!(
             result.is_ok(),
             "builtin filters failed to compile: {:?}",
@@ -1496,7 +1591,14 @@ gcc -O2 foo.c
         let mut outcomes = Vec::new();
         let mut all_names = Vec::new();
         let mut tested = std::collections::HashSet::new();
-        collect_test_outcomes(content, None, &mut outcomes, &mut all_names, &mut tested);
+        collect_test_outcomes(
+            content,
+            None,
+            &mut outcomes,
+            &mut all_names,
+            &mut tested,
+            true,
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0].passed,
@@ -1522,7 +1624,14 @@ expected = "wrong output"
         let mut outcomes = Vec::new();
         let mut all_names = Vec::new();
         let mut tested = std::collections::HashSet::new();
-        collect_test_outcomes(content, None, &mut outcomes, &mut all_names, &mut tested);
+        collect_test_outcomes(
+            content,
+            None,
+            &mut outcomes,
+            &mut all_names,
+            &mut tested,
+            true,
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(!outcomes[0].passed);
     }
@@ -1538,7 +1647,14 @@ match_command = "^make\\b"
         let mut outcomes = Vec::new();
         let mut all_names = Vec::new();
         let mut tested = std::collections::HashSet::new();
-        collect_test_outcomes(content, None, &mut outcomes, &mut all_names, &mut tested);
+        collect_test_outcomes(
+            content,
+            None,
+            &mut outcomes,
+            &mut all_names,
+            &mut tested,
+            true,
+        );
         // No tests defined, but filter exists
         assert_eq!(outcomes.len(), 0);
         assert!(all_names.contains(&"make".to_string()));
@@ -1641,6 +1757,7 @@ match_command = "^make\\b"
             &mut outcomes,
             &mut all_names,
             &mut tested,
+            true,
         );
 
         let untested: Vec<&str> = all_names

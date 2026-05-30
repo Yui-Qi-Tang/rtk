@@ -39,9 +39,11 @@ pub fn run(filter: Option<&str>, show_all: bool, verbose: u8) -> Result<()> {
             .iter()
             .any(|p| key.to_lowercase().contains(p));
 
-        let display_value = if is_sensitive && !show_all {
+        // Sensitive values are ALWAYS masked (#640 E-3): --show-all no longer
+        // reveals secrets, it only un-truncates long non-sensitive values.
+        let display_value = if is_sensitive {
             mask_value(value)
-        } else if value.len() > 100 {
+        } else if !show_all && value.len() > 100 {
             let preview: String = value.chars().take(50).collect();
             format!("{}... ({} chars)", preview, value.chars().count())
         } else {
@@ -149,6 +151,11 @@ fn get_sensitive_patterns() -> HashSet<&'static str> {
     set.insert("apikey");
     set.insert("access_key");
     set.insert("jwt");
+    // #640 E-3: cover common abbreviations (MYSQL_PWD, DB_PASSWD, *_PASSPHRASE).
+    set.insert("passwd");
+    set.insert("passphrase");
+    set.insert("pwd");
+    set.insert("session");
     set
 }
 
@@ -301,5 +308,22 @@ mod tests {
         assert!(patterns.contains("secret"));
         assert!(patterns.contains("password"));
         assert!(patterns.contains("token"));
+    }
+
+    #[test]
+    fn test_sensitive_patterns_cover_abbreviations() {
+        // #640 E-3: common secret-var abbreviations must be detected.
+        let patterns = get_sensitive_patterns();
+        for p in ["passwd", "passphrase", "pwd"] {
+            assert!(patterns.contains(p), "missing pattern: {p}");
+        }
+        // Representative real-world keys must be flagged as sensitive.
+        for key in ["MYSQL_PWD", "DB_PASSWD", "GPG_PASSPHRASE"] {
+            let lower = key.to_lowercase();
+            assert!(
+                patterns.iter().any(|p| lower.contains(p)),
+                "should flag {key} as sensitive"
+            );
+        }
     }
 }

@@ -5,7 +5,6 @@ use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::process::Command;
 
 const MAX_RUNNER_FAILURES: usize = CAP_WARNINGS;
 const MAX_RUNNER_LINES: usize = CAP_LIST;
@@ -102,24 +101,12 @@ impl StreamFilter for ErrorStreamFilter {
     }
 }
 
-fn build_shell_command(command: &str) -> Command {
-    if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    }
-}
-
 /// Run a command and filter output to show only errors/warnings
 pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
     if verbose > 0 {
         eprintln!("Running: {}", command);
     }
-    let cmd = build_shell_command(command);
+    let cmd = crate::core::utils::build_exec_command(command)?;
     crate::core::runner::run_streamed(
         cmd,
         "err",
@@ -134,7 +121,7 @@ pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
     if verbose > 0 {
         eprintln!("Running tests: {}", command);
     }
-    let cmd = build_shell_command(command);
+    let cmd = crate::core::utils::build_exec_command(command)?;
     let command_owned = command.to_string();
     crate::core::runner::run_filtered(
         cmd,

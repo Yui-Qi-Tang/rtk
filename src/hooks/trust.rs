@@ -9,10 +9,10 @@
 //! - Untrusted filters are **skipped** (not "loaded with warning")
 //! - `rtk trust` stores the SHA-256 hash after user review
 //! - Content changes invalidate trust (re-review required)
-//! - `RTK_TRUST_PROJECT_FILTERS=1` overrides for CI pipelines
+//! - Trust is granted only via `rtk trust` — there is no env-var override
 
 use super::integrity;
-use crate::core::constants::{RTK_DATA_DIR, TRUSTED_FILTERS_JSON};
+use crate::core::constants::{FILTERS_TOML, RTK_DATA_DIR, TRUSTED_FILTERS_JSON};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,7 +39,6 @@ pub enum TrustStatus {
     Trusted,
     Untrusted,
     ContentChanged { expected: String, actual: String },
-    EnvOverride,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,27 +88,13 @@ fn canonical_key(filter_path: &Path) -> Result<String> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Check if a project-local filter file is trusted.
+/// Check if a filter file is trusted.
 ///
-/// Priority: env var > hash match > untrusted.
+/// Trust is granted only via `rtk trust` (SHA-256 pinning). There is no
+/// environment-variable override — a repo's own build scripts must never be
+/// able to self-authorize their filters (#640 D-1).
 /// All errors are soft — if anything fails, returns Untrusted (fail-secure).
 pub fn check_trust(filter_path: &Path) -> Result<TrustStatus> {
-    // Fast path: env var override for CI pipelines only.
-    // Requires a known CI env var to be set to prevent .envrc injection attacks.
-    if std::env::var("RTK_TRUST_PROJECT_FILTERS").as_deref() == Ok("1") {
-        let in_ci = std::env::var("CI").is_ok()
-            || std::env::var("GITHUB_ACTIONS").is_ok()
-            || std::env::var("GITLAB_CI").is_ok()
-            || std::env::var("JENKINS_URL").is_ok()
-            || std::env::var("BUILDKITE").is_ok();
-        if in_ci {
-            return Ok(TrustStatus::EnvOverride);
-        }
-        eprintln!(
-            "[rtk] WARNING: RTK_TRUST_PROJECT_FILTERS=1 ignored (CI environment not detected)"
-        );
-    }
-
     let key = canonical_key(filter_path)?;
     let store = match read_store() {
         Ok(s) => s,
@@ -177,15 +162,50 @@ pub fn list_trusted() -> Result<HashMap<String, TrustEntry>> {
 // CLI commands
 // ---------------------------------------------------------------------------
 
-/// Run `rtk trust` — review and trust project-local filters.
+/// Path to the user-global filter file (`~/.config/rtk/filters.toml`).
+fn global_filter_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join(RTK_DATA_DIR).join(FILTERS_TOML))
+}
+
+/// Review one filter file and store its hash as trusted (read once to avoid TOCTOU).
+fn review_and_trust(filter_path: &Path, label: &str) -> Result<()> {
+    let content_bytes =
+        std::fs::read(filter_path).with_context(|| format!("Failed to read {}", label))?;
+    let content = String::from_utf8_lossy(&content_bytes);
+
+    println!("=== {} ===", label);
+    println!("{}", content);
+    println!("{}", "=".repeat(label.len() + 8));
+    println!();
+
+    print_risk_summary(&content);
+
+    let hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&content_bytes);
+        format!("{:x}", h.finalize())
+    };
+
+    trust_filter_with_hash(filter_path, &hash)?;
+    println!();
+    println!(
+        "Trusted {} (sha256:{})",
+        label,
+        hash.get(..16).unwrap_or(&hash)
+    );
+    Ok(())
+}
+
+/// Run `rtk trust` — review and trust project-local and user-global filters.
 pub fn run_trust(list: bool) -> Result<()> {
     if list {
         let trusted = list_trusted()?;
         if trusted.is_empty() {
-            println!("No trusted project filters.");
+            println!("No trusted filters.");
             return Ok(());
         }
-        println!("Trusted project filters:");
+        println!("Trusted filters:");
         println!("{}", "═".repeat(60));
         for (path, entry) in &trusted {
             let date = entry.trusted_at.get(..10).unwrap_or(&entry.trusted_at);
@@ -195,54 +215,53 @@ pub fn run_trust(list: bool) -> Result<()> {
         return Ok(());
     }
 
-    let filter_path = Path::new(".rtk/filters.toml");
-    if !filter_path.exists() {
-        anyhow::bail!("No .rtk/filters.toml found in current directory");
+    let mut trusted_any = false;
+
+    let project = PathBuf::from(".rtk/filters.toml");
+    if project.exists() {
+        review_and_trust(&project, ".rtk/filters.toml")?;
+        trusted_any = true;
     }
 
-    // Read ONCE to prevent TOCTOU: display + hash from same buffer
-    let content_bytes = std::fs::read(filter_path).context("Failed to read .rtk/filters.toml")?;
-    let content = String::from_utf8_lossy(&content_bytes);
+    if let Some(global) = global_filter_path() {
+        if global.exists() {
+            let label = global.display().to_string();
+            review_and_trust(&global, &label)?;
+            trusted_any = true;
+        }
+    }
 
-    println!("=== .rtk/filters.toml ===");
-    println!("{}", content);
-    println!("=========================");
+    if !trusted_any {
+        anyhow::bail!(
+            "No filters.toml found (.rtk/filters.toml in CWD or ~/.config/rtk/filters.toml)"
+        );
+    }
     println!();
-
-    // Risk summary
-    print_risk_summary(&content);
-
-    // Hash the in-memory buffer (not a second file read)
-    let hash = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(&content_bytes);
-        format!("{:x}", h.finalize())
-    };
-
-    // Store trust with pre-computed hash
-    trust_filter_with_hash(filter_path, &hash)?;
-    println!();
-    println!(
-        "Trusted .rtk/filters.toml (sha256:{})",
-        hash.get(..16).unwrap_or(&hash)
-    );
-    println!("Project-local filters will now be applied.");
-
+    println!("Trusted filters will now be applied.");
     Ok(())
 }
 
-/// Run `rtk untrust` — revoke trust for project-local filters.
+/// Run `rtk untrust` — revoke trust for project-local and user-global filters.
 pub fn run_untrust() -> Result<()> {
-    let filter_path = Path::new(".rtk/filters.toml");
-    // If file doesn't exist, untrust by canonical path lookup won't work.
-    // Try anyway (file may have been deleted after trust), fallback gracefully.
-    let removed = untrust_filter(filter_path).unwrap_or(false);
-    if removed {
+    let mut revoked_any = false;
+
+    let project = Path::new(".rtk/filters.toml");
+    if untrust_filter(project).unwrap_or(false) {
         println!("Trust revoked for .rtk/filters.toml");
-        println!("Project-local filters will no longer be applied.");
+        revoked_any = true;
+    }
+
+    if let Some(global) = global_filter_path() {
+        if untrust_filter(&global).unwrap_or(false) {
+            println!("Trust revoked for {}", global.display());
+            revoked_any = true;
+        }
+    }
+
+    if revoked_any {
+        println!("Affected filters will no longer be applied.");
     } else {
-        println!("No trust entry found for current directory.");
+        println!("No trust entry found for project-local or global filters.");
     }
     Ok(())
 }
@@ -283,6 +302,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn test_global_filter_path_points_at_rtk_filters() {
+        // The global filter is now trust-gated (#640 D-2); confirm `rtk trust`
+        // targets the canonical ~/.config/rtk/filters.toml location.
+        let p = global_filter_path().expect("config dir should resolve");
+        assert!(p.ends_with("rtk/filters.toml"), "got: {}", p.display());
+    }
+
     /// Helper: create a temporary trust store in a temp dir.
     /// Overrides the store path via a scoped env var (not possible with
     /// the real function), so we test the logic by calling internal fns.
@@ -292,8 +319,7 @@ mod tests {
     }
 
     fn check_trust_with_store(filter_path: &Path, store_file: &Path) -> Result<TrustStatus> {
-        // Note: env var check is NOT included here to avoid test interference.
-        // The env var path is tested separately in test_env_override.
+        // Mirrors check_trust but against an isolated store file for tests.
         let key = canonical_key(filter_path)?;
 
         let store: TrustStore = if store_file.exists() {
@@ -432,12 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn test_env_override_with_ci() {
+    fn test_env_var_no_longer_bypasses_trust() {
+        // #640 D-1: the RTK_TRUST_PROJECT_FILTERS env override was removed.
+        // Even with it (and a CI indicator) set, an unstored filter is Untrusted.
         let temp = TempDir::new().unwrap();
         let filter = temp.path().join("filters.toml");
         std::fs::write(&filter, "[filters.test]\nmatch_command = \"echo\"").unwrap();
 
-        // Both env vars must be set: trust override + CI indicator
         #[allow(deprecated)]
         std::env::set_var("RTK_TRUST_PROJECT_FILTERS", "1");
         #[allow(deprecated)]
@@ -448,22 +475,11 @@ mod tests {
         #[allow(deprecated)]
         std::env::remove_var("CI");
 
-        assert_eq!(status, TrustStatus::EnvOverride);
-    }
-
-    #[test]
-    fn test_env_override_without_ci_is_ignored() {
-        let temp = TempDir::new().unwrap();
-        let filter = temp.path().join("filters.toml");
-        std::fs::write(&filter, "[filters.test]\nmatch_command = \"echo\"").unwrap();
-        let store_file = setup_test_env(&temp);
-
-        // Trust override WITHOUT CI env → should be Untrusted, not EnvOverride
-        // (protects against .envrc injection)
-        // Note: we use check_trust_with_store which skips env var check,
-        // so this tests the store path when env var would be ignored
-        let status = check_trust_with_store(&filter, &store_file).unwrap();
-        assert_eq!(status, TrustStatus::Untrusted);
+        assert_eq!(
+            status,
+            TrustStatus::Untrusted,
+            "env var must not grant trust"
+        );
     }
 
     #[test]

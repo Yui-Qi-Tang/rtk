@@ -36,9 +36,18 @@ fn sanitize_slug(slug: &str) -> String {
 
 /// Get the tee directory, respecting config and env overrides.
 fn get_tee_dir(config: &Config) -> Option<PathBuf> {
-    // Env var override
+    // Env var override. Require an absolute path: a relative RTK_TEE_DIR set via
+    // a tool call could redirect raw (possibly secret-bearing) output to an
+    // unexpected location like ../../somewhere (#640 F-1). Reject and fall back.
     if let Ok(dir) = std::env::var("RTK_TEE_DIR") {
-        return Some(PathBuf::from(dir));
+        let path = PathBuf::from(&dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        eprintln!(
+            "rtk: RTK_TEE_DIR must be an absolute path, ignoring: {}",
+            dir
+        );
     }
 
     // Config override
@@ -112,6 +121,9 @@ fn write_tee_file(
     max_files: usize,
 ) -> Option<PathBuf> {
     std::fs::create_dir_all(tee_dir).ok()?;
+    // Privacy hardening (#1790/#656): tee logs hold raw, unfiltered command
+    // output that can include secrets. Restrict the directory to owner-only.
+    crate::core::utils::restrict_permissions(tee_dir, 0o700);
 
     let slug = sanitize_slug(command_slug);
     let epoch = std::time::SystemTime::now()
@@ -139,6 +151,7 @@ fn write_tee_file(
     };
 
     std::fs::write(&filepath, content).ok()?;
+    crate::core::utils::restrict_permissions(&filepath, 0o600);
 
     // Rotate old files
     cleanup_old_files(tee_dir, max_files);
@@ -285,6 +298,28 @@ mod tests {
     }
 
     #[test]
+    fn test_get_tee_dir_rejects_relative_env() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let config = Config::default();
+
+        std::env::set_var("RTK_TEE_DIR", "relative/evil");
+        let dir = get_tee_dir(&config);
+        std::env::remove_var("RTK_TEE_DIR");
+        assert_ne!(
+            dir,
+            Some(PathBuf::from("relative/evil")),
+            "relative RTK_TEE_DIR must be rejected"
+        );
+
+        std::env::set_var("RTK_TEE_DIR", "/tmp/rtk-tee-abs");
+        let dir2 = get_tee_dir(&config);
+        std::env::remove_var("RTK_TEE_DIR");
+        assert_eq!(dir2, Some(PathBuf::from("/tmp/rtk-tee-abs")));
+    }
+
+    #[test]
     fn test_should_tee_disabled() {
         let config = TeeConfig {
             enabled: false,
@@ -353,6 +388,25 @@ mod tests {
         assert!(path.exists());
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("error: test failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_tee_file_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path().join("tee");
+        let content = "secret token=abc123\n".repeat(50);
+        let result = write_tee_file(&content, "curl", &dir, DEFAULT_MAX_FILE_SIZE, 20);
+        let path = result.expect("tee file should be written");
+
+        // File must not be group/other-readable (#1790/#656).
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "tee log should be owner-only (0600)");
+
+        // Directory must be owner-only too.
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "tee dir should be owner-only (0700)");
     }
 
     #[test]

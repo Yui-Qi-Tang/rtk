@@ -294,6 +294,17 @@ pub fn split_on_operators(cmd: &str, stop_at_pipe: bool) -> Vec<&str> {
                 }
                 seg_start = tok.offset + tok.value.len();
             }
+            // A lone `&` is the background operator: `cmd1 & cmd2` runs BOTH, so
+            // it must be a segment boundary for permission checking — otherwise
+            // `gh pr list & rm -rf ~` is one segment that matches an allow rule
+            // and the `rm` gets auto-allowed (red-team finding; cf. #1213).
+            TokenKind::Shellism if tok.value == "&" => {
+                let segment = trimmed[seg_start..tok.offset].trim();
+                if !segment.is_empty() {
+                    results.push(segment);
+                }
+                seg_start = tok.offset + tok.value.len();
+            }
             _ => {}
         }
     }
@@ -1014,6 +1025,22 @@ mod tests {
         assert_eq!(
             split_on_operators("a && b | c ; d", false),
             vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn test_split_on_operators_background_amp() {
+        // Lone `&` (background) is a segment boundary (red-team finding).
+        assert_eq!(
+            split_on_operators("gh pr list & rm -rf ~", false),
+            vec!["gh pr list", "rm -rf ~"]
+        );
+        // Trailing background `&` leaves a single segment.
+        assert_eq!(split_on_operators("sleep 5 &", false), vec!["sleep 5"]);
+        // `&` inside quotes is NOT a boundary.
+        assert_eq!(
+            split_on_operators(r#"echo "a & b""#, false),
+            vec![r#"echo "a & b""#]
         );
     }
 

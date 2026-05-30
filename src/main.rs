@@ -639,14 +639,14 @@ enum Commands {
         passthrough: bool,
     },
 
-    /// Trust project-local TOML filters in current directory
+    /// Trust project-local (.rtk/filters.toml) and user-global TOML filters
     Trust {
         /// List all trusted projects
         #[arg(long)]
         list: bool,
     },
 
-    /// Revoke trust for project-local TOML filters
+    /// Revoke trust for project-local and user-global TOML filters
     Untrust,
 
     /// Verify hook integrity and run TOML filter inline tests
@@ -1400,7 +1400,9 @@ where
 }
 
 fn run_cli() -> Result<i32> {
-    // Fire-and-forget telemetry ping (1/day, non-blocking)
+    // Telemetry is hard-disabled in this build (#640 C-1): maybe_ping() returns
+    // immediately unless RTK_TELEMETRY_FORCE_SEND=1 is explicitly set, so rtk
+    // never phones home by default regardless of config/compile-time URL.
     core::telemetry::maybe_ping();
 
     let cli = match Cli::try_parse() {
