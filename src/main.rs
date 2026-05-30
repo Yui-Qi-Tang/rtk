@@ -1400,7 +1400,9 @@ where
 }
 
 fn run_cli() -> Result<i32> {
-    // Fire-and-forget telemetry ping (1/day, non-blocking)
+    // Telemetry is hard-disabled in this build (#640 C-1): maybe_ping() returns
+    // immediately unless RTK_TELEMETRY_FORCE_SEND=1 is explicitly set, so rtk
+    // never phones home by default regardless of config/compile-time URL.
     core::telemetry::maybe_ping();
 
     let cli = match Cli::try_parse() {

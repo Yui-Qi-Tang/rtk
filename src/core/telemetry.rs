@@ -18,6 +18,14 @@ const PING_INTERVAL_SECS: u64 = 23 * 3600; // 23 hours
 /// Send a telemetry ping if enabled and not already sent today.
 /// Fire-and-forget: errors are silently ignored.
 pub fn maybe_ping() {
+    // Hardened build (#640 C-1): network egress is OFF by default. The daily
+    // ping only runs when explicitly opted in per-process via
+    // RTK_TELEMETRY_FORCE_SEND=1. Without it rtk never contacts the network,
+    // regardless of consent/config or a compile-time RTK_TELEMETRY_URL.
+    if std::env::var("RTK_TELEMETRY_FORCE_SEND").as_deref() != Ok("1") {
+        return;
+    }
+
     // No URL compiled in → telemetry disabled
     if TELEMETRY_URL.is_none() {
         return;
