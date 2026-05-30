@@ -1462,26 +1462,47 @@ impl TimedExecution {
 }
 
 /// Redact likely-secret values from a command string before persistence (#640
-/// E-1/E-2). Conservative best-effort over four shapes: credential flags
-/// (`--password X`, `--token=X`, …), `Authorization:` headers, sensitive
-/// `KEY=value` env assignments, and inline URL credentials (`scheme://u:p@`).
-/// Never panics; returns the input unchanged when nothing matches.
+/// E-1/E-2). Best-effort denylist hardened against a red-team pass: credential
+/// flags (long flags + glued short `-phunter2` + `-u user:pass`), any
+/// `Authorization:`/secret-header value, sensitive `KEY=value` env, secret JSON
+/// keys, and inline URL credentials. Cannot catch arbitrarily-named secrets
+/// (e.g. `STRIPE_SK=…`) — see RED_BLUE.md. Never panics.
 pub fn redact_sensitive_args(cmd: &str) -> String {
     lazy_static! {
+        // Long flags: --password X / --token=X / ...
         static ref FLAG_RE: Regex = Regex::new(
             r"(?i)(--?(?:password|passwd|token|secret|api[-_]?key|access[-_]?key|auth[-_]?token|client[-_]?secret))([=\s]+)(\S+)"
         ).unwrap();
+        // Glued short password flags: -phunter2 / -Wsecret (value attached).
+        static ref SHORT_GLUED_RE: Regex = Regex::new(r"(\s-[pW])([^\s=-]\S*)").unwrap();
+        // curl-style user:password (-u user:pass).
+        static ref USERPASS_RE: Regex = Regex::new(r"(\s-u\s+[^\s:]+:)(\S+)").unwrap();
+        // Any Authorization scheme (Bearer/Basic/ApiKey/Digest/…) or bare token.
         static ref AUTH_RE: Regex =
-            Regex::new(r"(?i)(authorization:\s*(?:bearer|basic|token)\s+)([^\s'\x22]+)").unwrap();
-        static ref ENV_RE: Regex = Regex::new(
-            r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|token|secret|api[_-]?key|access[_-]?key|credential|private[_-]?key)[A-Za-z0-9_]*)=(\S+)"
+            Regex::new(r"(?i)(authorization:\s*)([a-z]+\s+)?([^\s'\x22]+)").unwrap();
+        // Other secret-bearing HTTP headers.
+        static ref HEADER_RE: Regex = Regex::new(
+            r#"(?i)((?:x-api-key|x-auth-token|x-amz-security-token|private-token|api-key|cookie|x-secret-token)\s*:\s*)([^\s'\x22]+)"#
         ).unwrap();
+        // Sensitive env assignments. Adds pwd/pass/passphrase over the original.
+        static ref ENV_RE: Regex = Regex::new(
+            r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|passphrase|pwd|pass|token|secret|api[_-]?key|access[_-]?key|credential|private[_-]?key)[A-Za-z0-9_]*)=(\S+)"
+        ).unwrap();
+        // Secret keys inside JSON/dict bodies: "password": "x".
+        static ref JSON_RE: Regex = Regex::new(
+            r#"(?i)("(?:password|passwd|pwd|pass|passphrase|token|secret|api[_-]?key|access[_-]?key|credential|client[_-]?secret)"\s*:\s*")([^"]*)(")"#
+        ).unwrap();
+        // Inline URL credentials, including empty username (redis://:pass@).
         static ref URL_RE: Regex =
-            Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+):([^@/\s]+)@").unwrap();
+            Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]*):([^@/\s]+)@").unwrap();
     }
     let s = FLAG_RE.replace_all(cmd, "${1}${2}***");
-    let s = AUTH_RE.replace_all(&s, "${1}***");
+    let s = SHORT_GLUED_RE.replace_all(&s, "${1}***");
+    let s = USERPASS_RE.replace_all(&s, "${1}***");
+    let s = AUTH_RE.replace_all(&s, "${1}${2}***");
+    let s = HEADER_RE.replace_all(&s, "${1}***");
     let s = ENV_RE.replace_all(&s, "${1}=***");
+    let s = JSON_RE.replace_all(&s, "${1}***${3}");
     let s = URL_RE.replace_all(&s, "${1}:***@");
     s.into_owned()
 }
@@ -1735,6 +1756,54 @@ mod tests {
 
         // Non-sensitive command is unchanged.
         assert_eq!(redact_sensitive_args("git status -s"), "git status -s");
+    }
+
+    // Red-team regression corpus (#640 E-1): each secret must be gone.
+    #[test]
+    fn test_redact_sensitive_args_redteam_corpus() {
+        let cases = [
+            // glued + spaced short flags
+            ("mysql -phunter2 db", "hunter2"),
+            ("mysqldump -pMyP4ss dbname", "MyP4ss"),
+            ("curl -u admin:s3cret http://x", "s3cret"),
+            // env var name gaps
+            ("MYSQL_PWD=hunter2 mysql", "hunter2"),
+            ("DB_PASS=hunter2 app", "hunter2"),
+            ("PASSPHRASE=abc gpg", "abc"),
+            // non-Authorization headers
+            ("curl -H 'X-Api-Key: SEKRET' http://x", "SEKRET"),
+            ("curl -H 'Cookie: session=SEKRET' http://x", "SEKRET"),
+            ("curl -H 'PRIVATE-TOKEN: SEKRET' http://x", "SEKRET"),
+            ("curl -H 'X-Auth-Token: SEKRET' http://x", "SEKRET"),
+            // auth schemes beyond bearer/basic/token
+            ("curl -H 'Authorization: ApiKey SEKRET' http://x", "SEKRET"),
+            ("curl -H 'Authorization: Digest SEKRET' http://x", "SEKRET"),
+            // JSON bodies
+            (r#"curl -d '{"password":"hunter2"}'"#, "hunter2"),
+            (r#"curl -d '{"api_key": "abc123"}'"#, "abc123"),
+            // URL userinfo with empty username
+            ("redis-cli -u redis://:p4ss@host:6379", "p4ss"),
+        ];
+        for (input, secret) in cases {
+            let out = redact_sensitive_args(input);
+            assert!(
+                !out.contains(secret),
+                "secret '{secret}' survived in: {out}  (input: {input})"
+            );
+        }
+    }
+
+    // Guard against over-redaction of common non-secret `-p` uses.
+    #[test]
+    fn test_redact_does_not_over_redact_plain_p_flag() {
+        assert_eq!(
+            redact_sensitive_args("mkdir -p /tmp/foo/bar"),
+            "mkdir -p /tmp/foo/bar"
+        );
+        assert_eq!(
+            redact_sensitive_args("docker run -p 8080:80 img"),
+            "docker run -p 8080:80 img"
+        );
     }
 
     // record() must persist the REDACTED command, not the raw secret.
