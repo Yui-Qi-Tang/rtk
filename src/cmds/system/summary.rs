@@ -6,7 +6,6 @@ use crate::core::truncate::CAP_WARNINGS;
 use crate::core::utils::truncate;
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::process::Command;
 
 const MAX_SUMMARY_LIST: usize = CAP_WARNINGS;
 const MAX_SUMMARY_KEYS: usize = CAP_WARNINGS;
@@ -19,15 +18,8 @@ pub fn run(command: &str, verbose: u8) -> Result<i32> {
         eprintln!("Running and summarizing: {}", command);
     }
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
+    // Execute directly (no shell) to avoid sh -c injection (#640 B-1).
+    let mut cmd = crate::core::utils::build_exec_command(command)?;
     let result = exec_capture(&mut cmd).context("Failed to execute command")?;
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);
