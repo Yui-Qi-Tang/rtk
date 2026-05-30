@@ -247,12 +247,24 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new() -> Result<Self> {
-        let db_path = get_db_path()?;
+        Self::open_at(get_db_path()?)
+    }
+
+    /// Open (creating if needed) a tracker at an explicit DB path.
+    ///
+    /// Shared by [`new`](Self::new) and the test-only [`new_at`](Self::new_at)
+    /// so permission hardening and schema setup live in one place.
+    fn open_at(db_path: PathBuf) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Privacy hardening (#1790/#1160): the tracking DB holds full command
+            // history and project paths. Restrict the data dir to owner-only so
+            // WAL/SHM sidecars are also protected, regardless of the file umask.
+            crate::core::utils::restrict_permissions(parent, 0o700);
         }
 
         let conn = Connection::open(&db_path)?;
+        crate::core::utils::restrict_permissions(&db_path, 0o600);
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
         let _ = conn.execute_batch(
@@ -324,6 +336,15 @@ impl Tracker {
         )?;
 
         Ok(Self { conn })
+    }
+
+    /// Open a tracker at an explicit on-disk path (tests only).
+    ///
+    /// Lets permission tests inject a temp path without mutating the global
+    /// `RTK_DB_PATH` env var (which would race other tests).
+    #[cfg(test)]
+    pub fn new_at(path: &std::path::Path) -> Result<Self> {
+        Self::open_at(path.to_path_buf())
     }
 
     /// Create an isolated in-memory tracker for tests.
@@ -1257,9 +1278,23 @@ pub struct ParseFailureSummary {
 /// Record a parse failure without ever crashing.
 /// Silently ignores all errors — used in the fallback path.
 pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succeeded: bool) {
+    if !is_tracking_enabled() {
+        return;
+    }
     if let Ok(tracker) = Tracker::new() {
         let _ = tracker.record_parse_failure(raw_command, error_message, succeeded);
     }
+}
+
+/// Whether command-history tracking writes are enabled.
+///
+/// Honors `[tracking] enabled = false` in config.toml (#1875). On any config
+/// load error, defaults to `true` to preserve existing behavior — tracking is
+/// the default and a missing/unreadable config must not silently disable it.
+pub fn is_tracking_enabled() -> bool {
+    crate::core::config::Config::load()
+        .map(|c| c.tracking.enabled)
+        .unwrap_or(true)
 }
 
 /// Estimate token count from text using ~4 chars = 1 token heuristic.
@@ -1354,6 +1389,23 @@ impl TimedExecution {
     /// timer.track("ls -la", "rtk ls", input, output);
     /// ```
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
+        self.track_with(original_cmd, rtk_cmd, input, output, is_tracking_enabled());
+    }
+
+    /// Inner implementation with the tracking-enabled decision injected, so the
+    /// `[tracking] enabled = false` gate (#1875) can be tested deterministically.
+    /// Returns `true` if a record was attempted, `false` if tracking was gated off.
+    fn track_with(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input: &str,
+        output: &str,
+        enabled: bool,
+    ) -> bool {
+        if !enabled {
+            return false;
+        }
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
@@ -1367,6 +1419,7 @@ impl TimedExecution {
                 elapsed_ms,
             );
         }
+        true
     }
 
     /// Track passthrough commands (timing-only, no token counting).
@@ -1390,6 +1443,9 @@ impl TimedExecution {
     /// timer.track_passthrough("git tag", "rtk git tag");
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
+        if !is_tracking_enabled() {
+            return;
+        }
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         // input_tokens=0, output_tokens=0 won't dilute savings statistics
         if let Ok(tracker) = Tracker::new() {
@@ -1566,6 +1622,63 @@ mod tests {
             "expected default path ending with rtk/history.db, got: {}",
             db_path.display()
         );
+    }
+
+    // Privacy hardening (#1790/#1160): opening a tracker must restrict the DB
+    // file and its parent dir to owner-only on Unix. Uses new_at to avoid
+    // mutating the global RTK_DB_PATH env var (which would race other tests).
+    #[cfg(unix)]
+    #[test]
+    fn test_new_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("data").join("history.db");
+
+        let _tracker = Tracker::new_at(&db_path).expect("Tracker::new_at should succeed");
+
+        let file_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "tracking DB should be owner-only (0600)");
+        let dir_mode = std::fs::metadata(db_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "tracking dir should be owner-only (0700)");
+    }
+
+    // tracking.enabled = false is enforced (#1875 finding 3): track_with(false)
+    // must not attempt a record; track_with(true) must. The bool return makes
+    // the gate observable without touching the global DB / env.
+    #[test]
+    fn test_track_respects_enabled_flag() {
+        let timer = TimedExecution::start();
+        assert!(
+            !timer.track_with(
+                "git status",
+                "rtk git status",
+                "long output here",
+                "short",
+                false
+            ),
+            "disabled tracking must not record"
+        );
+        assert!(
+            timer.track_with(
+                "git status",
+                "rtk git status",
+                "long output here",
+                "short",
+                true
+            ),
+            "enabled tracking must record"
+        );
+    }
+
+    // is_tracking_enabled defaults to true when no config file is present.
+    #[test]
+    fn test_is_tracking_enabled_defaults_true() {
+        assert!(is_tracking_enabled());
     }
 
     // 9. project_filter_params uses GLOB pattern with * wildcard // added
