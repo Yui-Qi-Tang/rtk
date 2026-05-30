@@ -361,3 +361,23 @@ re-checked the load-bearing conclusions directly. Results:
 | D-3 trust mechanism (`rtk trust`, SHA-256 pin) present | ✅ verified (read during A/B work) |
 
 Net correction: one over-broad telemetry claim fixed. Everything else held.
+
+---
+
+## Red/blue adversarial round (executed red-team → fixes)
+
+Ran a white-box red-team pass (playbook + verbatim prompts in `RED_BLUE.md`):
+attacker subagents generated payloads, every payload was **executed** against the
+real binary/functions, confirmed gaps were fixed and locked with regression
+tests. Findings:
+
+| Surface | Result | Fix |
+|---------|--------|-----|
+| B-1 `build_exec_command` (shell injection) | **no leaks** — held vs escaped `;`, glob, tab/`\r`, fullwidth `；`, line-continuation | — (locked with tests) |
+| **Hook `&` separator** (NEW, critical) | `gh pr list & rm -rf ~` rode the `gh pr *` allow rule → auto-allowed `rm` | `discover/lexer.rs`: lone `&` is now a permission segment boundary |
+| E-1 redaction | 21 leaks (glued `-p`, `-u user:pass`, `MYSQL_PWD`/`DB_PASS`/`PASSPHRASE`, `X-Api-Key`/`Cookie`/`PRIVATE-TOKEN`, `Authorization: ApiKey/Digest`, JSON bodies, empty-user URL) | `tracking.rs`: added short-flag/header/JSON/env/empty-user patterns |
+| G-1 strip_ansi | survivors: unterminated OSC, ESC-in-URL, DCS/APC/PM/SOS, 8-bit C1 OSC | `utils.rs`: regex now covers string escapes + C1 + unterminated |
+
+Accepted residuals (documented in RED_BLUE.md): name-less secrets (`STRIPE_SK=`)
+can't be caught by a denylist; malformed CSI leaves a mangled (non-clickable)
+fragment. Gate after: clippy 0 warnings, `cargo test --all` **2005 passed / 0 failed**.
