@@ -198,6 +198,52 @@ low-risk, in-tree items were fixed on this branch:
 `cargo test --all` → **1993 passed, 0 failed, 7 ignored**.
 
 **Still NOT fixed on this branch (higher risk / upstream-coordinated):**
-B-1 `sh -c` injection (upstream PR #1194 OPEN), D-2 global-filter integrity
-(PR #1068 OPEN), D-1 CI-trust hardening, A-4 release checksum, E-3 `--show-all`
-confirm, H-1 audit-log rotation. See the review report for rationale.
+B-1 `sh -c` injection (upstream PR #1194 OPEN), D-1 CI-trust hardening,
+A-4 release checksum, E-3 `--show-all` confirm, H-1 audit-log rotation.
+See the review report for rationale.
+
+---
+
+## Filter trust hardening (A + B) — anti-tampering of the middle layer
+
+Goal: make RTK's output-filtering layer trustworthy — only filter noise, can't
+be silently tampered to hide/rewrite the truth. RTK has three filter sources:
+project `.rtk/filters.toml`, global `~/.config/rtk/filters.toml`, and built-in
+(`src/filters/*.toml`, embedded at compile time). The runtime-loaded user
+sources were the tamper surface.
+
+**A — trust-gate the global filter (#640 D-2).** `~/.config/rtk/filters.toml`
+was loaded unconditionally; now it goes through the same `check_trust()` +
+SHA-256 pinning as project filters (`core/toml_filter.rs::load`). Untrusted or
+changed → skipped with a warning until reviewed. `rtk trust` / `rtk untrust`
+were extended to review/trust/revoke the global file too (`hooks/trust.rs`,
+new `global_filter_path()` + `review_and_trust()` helpers; `main.rs` doc).
+
+**B — drop rewrite primitives from user filters (#640 A-1).**
+`parse_and_compile`/`compile_filter` now take `allow_rewrite`: only built-in
+filters may use `replace` / `match_output` (rewrite or swallow output).
+User filters (project + global) get those rules dropped with a notice — they
+may only strip/keep/truncate noise lines, never fabricate or hide via rewrite.
+`rtk verify` mirrors this (builtin=allow, project=deny).
+
+| File | Change | Tests |
+|------|--------|-------|
+| `core/toml_filter.rs` | `allow_rewrite` threading; global trust-gate in `load()` | 1 (`test_user_filter_rewrite_primitives_disabled`) |
+| `hooks/trust.rs` | `rtk trust/untrust` cover global file | 1 (`test_global_filter_path_*`) |
+| `main.rs` | `Trust`/`Untrust` doc updated | — |
+
+**Verification:** `cargo fmt` clean · `cargo clippy --all-targets` 0 warnings ·
+`cargo test --all` → **1995 passed, 0 failed, 7 ignored**.
+
+**⚠️ Behavior change for existing users:** anyone who already has a
+`~/.config/rtk/filters.toml` will see it stop applying after this change until
+they run `rtk trust` (fail-closed, same model as project filters). Any
+`replace`/`match_output` rules in their user filters become inert (noticed on
+stderr). This is intentional hardening.
+
+**Honest limits (not solved by A+B):** this raises the bar and makes tampering
+tamper-*evident*, but is not tamper-*proof* against an attacker with your uid
+(they could replace the `rtk` binary itself, alter PATH, or change the Claude
+Code hook config — OS-level controls are out of scope). Built-in filters still
+truncate, so "noise-only" is best-effort, not a guarantee — use `rtk proxy` /
+raw output when you need the complete, unfiltered result.
