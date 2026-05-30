@@ -47,7 +47,12 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 /// ```
 pub fn strip_ansi(text: &str) -> String {
     lazy_static::lazy_static! {
-        static ref ANSI_RE: Regex = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap();
+        // CSI sequences (colors/cursor) plus OSC sequences (e.g. OSC 8
+        // hyperlinks, window titles) terminated by BEL (\x07) or ST (ESC \).
+        // OSC can embed URLs, so leaving it intact would let attacker-controlled
+        // links reach the LLM context (#640 G-1).
+        static ref ANSI_RE: Regex =
+            Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)").unwrap();
     }
     ANSI_RE.replace_all(text, "").to_string()
 }
@@ -467,6 +472,22 @@ mod tests {
     fn test_strip_ansi_complex() {
         let input = "\x1b[32mGreen\x1b[0m normal \x1b[31mRed\x1b[0m";
         assert_eq!(strip_ansi(input), "Green normal Red");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc8_hyperlink_bel() {
+        // OSC 8 hyperlink (BEL-terminated): the embedded URL must not survive.
+        let input = "\x1b]8;;http://attacker.example/?leak=secret\x07click\x1b]8;;\x07";
+        let out = strip_ansi(input);
+        assert_eq!(out, "click");
+        assert!(!out.contains("attacker.example"));
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_title_st() {
+        // OSC window-title (ST-terminated: ESC backslash).
+        let input = "\x1b]0;my-secret-title\x1b\\hello";
+        assert_eq!(strip_ansi(input), "hello");
     }
 
     #[test]
