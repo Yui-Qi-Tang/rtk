@@ -48,8 +48,10 @@ def _pre_tool_call(tool_name=None, args=None, **_kwargs):
             return
 
         try:
+            # "--" marks end-of-options so a command starting with "-"/"--"
+            # can't be parsed as a flag to ``rtk rewrite`` itself (#1350).
             result = subprocess.run(
-                ["rtk", "rewrite", command],
+                ["rtk", "rewrite", "--", command],
                 shell=False,
                 timeout=2,
                 capture_output=True,

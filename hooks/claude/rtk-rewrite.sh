@@ -52,8 +52,20 @@ if [ -z "$CMD" ]; then
 fi
 
 # Delegate all rewrite + permission logic to the Rust binary.
-REWRITTEN=$(rtk rewrite "$CMD" 2>/dev/null)
+# `--` marks end-of-options so a command starting with `-`/`--` (e.g. "--help")
+# is treated as the command to rewrite, never as a flag to `rtk rewrite`
+# itself. Without it, `rtk rewrite "--help"` prints help text with exit 0 and
+# the hook would feed that text back as an auto-allowed command (#1350).
+REWRITTEN=$(rtk rewrite -- "$CMD" 2>/dev/null)
 EXIT_CODE=$?
+
+# Defense-in-depth: a legitimate rewrite is always a single, non-empty line.
+# If a rewrite-bearing exit code (0/3) yields empty or multi-line output, treat
+# it as no rewrite and pass through rather than auto-allowing unexpected text.
+if { [ "$EXIT_CODE" -eq 0 ] || [ "$EXIT_CODE" -eq 3 ]; } &&
+   { [ -z "$REWRITTEN" ] || [ "$(printf '%s' "$REWRITTEN" | wc -l)" -gt 0 ]; }; then
+  exit 0
+fi
 
 case $EXIT_CODE in
   0)

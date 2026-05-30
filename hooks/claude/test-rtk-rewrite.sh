@@ -327,6 +327,30 @@ test_rewrite "node (no pattern)" \
 
 echo ""
 
+# ---- SECTION 5b: Flag-injection regression (#1350) ----
+# A command starting with -/-- must never be parsed as a flag to `rtk rewrite`.
+# Before the `--` terminator fix, "--help" produced help text + exit 0, which
+# the hook then auto-allowed as the rewritten command.
+echo "--- Flag-injection regression (#1350) ---"
+
+test_rewrite "flag-injection: --help passes through" \
+  "--help" \
+  ""
+
+test_rewrite "flag-injection: --version passes through" \
+  "--version" \
+  ""
+
+test_rewrite "flag-injection: -h passes through" \
+  "-h" \
+  ""
+
+test_rewrite "flag-injection: -rf / passes through" \
+  "-rf /" \
+  ""
+
+echo ""
+
 # ---- SECTION 6: Audit logging ----
 echo "--- Audit logging (RTK_HOOK_AUDIT=1) ---"
 

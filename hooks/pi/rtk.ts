@@ -29,7 +29,9 @@ async function rewriteCommand(
   cmd: string,
   signal?: AbortSignal
 ): Promise<string | null> {
-  const result = await pi.exec("rtk", ["rewrite", cmd], {
+  // `--` marks end-of-options so a command starting with `-`/`--` can't be
+  // parsed as a flag to `rtk rewrite` itself (#1350).
+  const result = await pi.exec("rtk", ["rewrite", "--", cmd], {
     timeout: REWRITE_TIMEOUT_MS,
     signal,
   })

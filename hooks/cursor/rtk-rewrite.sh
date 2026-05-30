@@ -40,7 +40,16 @@ fi
 
 # Delegate all rewrite logic to the Rust binary.
 # rtk rewrite exits 1 when there's no rewrite — hook passes through silently.
-REWRITTEN=$(rtk rewrite "$CMD" 2>/dev/null) || { echo '{}'; exit 0; }
+# `--` marks end-of-options so a command starting with `-`/`--` can't be parsed
+# as a flag to `rtk rewrite` itself (#1350).
+REWRITTEN=$(rtk rewrite -- "$CMD" 2>/dev/null) || { echo '{}'; exit 0; }
+
+# Defense-in-depth: a legitimate rewrite is a single non-empty line.
+# Empty or multi-line output (e.g. accidental help text) → pass through.
+if [ -z "$REWRITTEN" ] || [ "$(printf '%s' "$REWRITTEN" | wc -l)" -gt 0 ]; then
+  echo '{}'
+  exit 0
+fi
 
 # No change — nothing to do.
 if [ "$CMD" = "$REWRITTEN" ]; then

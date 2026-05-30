@@ -26,7 +26,9 @@ export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {
       if (typeof command !== "string" || !command) return
 
       try {
-        const result = await $`rtk rewrite ${command}`.quiet().nothrow()
+        // `--` marks end-of-options so a command starting with `-`/`--` can't be
+        // parsed as a flag to `rtk rewrite` itself (#1350).
+        const result = await $`rtk rewrite -- ${command}`.quiet().nothrow()
         const rewritten = String(result.stdout).trim()
         if (rewritten && rewritten !== command) {
           ;(args as Record<string, unknown>).command = rewritten
