@@ -283,11 +283,27 @@ fn sanitize_log_field(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
+/// Max audit-log size before rotation (#640 H-1): the log grows unbounded and
+/// retains command arguments, so cap it and keep a single rotated generation.
+const AUDIT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// If `path` exceeds `max_bytes`, rotate it to `<name>.1` (replacing any prior
+/// rotation) so a fresh log starts. Best-effort; failures are ignored.
+fn rotate_audit_log_if_large(path: &std::path::Path, max_bytes: u64) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_bytes {
+            let rotated = path.with_file_name("hook-audit.log.1");
+            let _ = std::fs::rename(path, rotated);
+        }
+    }
+}
+
 fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> {
     let home = dirs::home_dir()?;
     let dir = home.join(".local").join("share").join("rtk");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("hook-audit.log");
+    rotate_audit_log_if_large(&path, AUDIT_LOG_MAX_BYTES);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -552,6 +568,23 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         crate::discover::registry::rewrite_command(cmd, excluded, &[])
+    }
+
+    #[test]
+    fn test_rotate_audit_log_when_over_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook-audit.log");
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+
+        // Under cap: untouched.
+        rotate_audit_log_if_large(&path, 1000);
+        assert!(path.exists());
+        assert!(!tmp.path().join("hook-audit.log.1").exists());
+
+        // Over cap: rotated to .1, original gone.
+        rotate_audit_log_if_large(&path, 10);
+        assert!(!path.exists(), "original should be rotated away");
+        assert!(tmp.path().join("hook-audit.log.1").exists());
     }
 
     // --- Copilot format detection ---
