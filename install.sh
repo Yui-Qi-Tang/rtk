@@ -98,6 +98,30 @@ install() {
         error "Failed to download binary"
     fi
 
+    # Verify SHA-256 checksum before trusting the binary (#640 A-4).
+    # Fail-closed: refuse to install an unverified binary unless the user
+    # explicitly sets RTK_ALLOW_UNVERIFIED=1.
+    info "Verifying checksum..."
+    EXPECTED_SHA=$(curl -fsSL "${DOWNLOAD_URL}.sha256" 2>/dev/null | awk '{print $1}')
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+    else
+        ACTUAL_SHA=""
+    fi
+
+    if [ -n "$EXPECTED_SHA" ] && [ -n "$ACTUAL_SHA" ]; then
+        if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+            error "Checksum mismatch (expected $EXPECTED_SHA, got $ACTUAL_SHA) — refusing to install"
+        fi
+        info "Checksum verified (sha256:$ACTUAL_SHA)"
+    elif [ "${RTK_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+        info "WARNING: skipping checksum verification (RTK_ALLOW_UNVERIFIED=1)"
+    else
+        error "Cannot verify checksum: no published .sha256 or no sha256 tool found. Set RTK_ALLOW_UNVERIFIED=1 to bypass (not recommended)."
+    fi
+
     # Verify archive contents before extraction (CWE-22 path traversal).
     # Reject any entry with an absolute path or a ".." component.
     info "Verifying archive..."
