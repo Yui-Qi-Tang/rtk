@@ -279,3 +279,34 @@ Remaining #640 risks fixed for the internal security-first build.
 inherent), A-2 hook auto-allow for *non-shell* rewrites (already default→ask),
 I-2 SQLite GLOB on Windows (macOS unaffected). These need design-level decisions
 rather than a localized patch.
+
+---
+
+## Reviewer follow-up (C-1 telemetry egress, G-2 exit codes)
+
+Two points raised in external review, both investigated directly:
+
+**C-1 — telemetry network egress → now hard-disabled.** Confirmed `maybe_ping()`
+→ `send_ping()` → `ureq::post()` (telemetry.rs) is a real network path,
+independent of the local SQLite tracking. In base it was already off-by-default
+(compile-time `option_env!` URL + `consent_given` defaulting to `None`), but for
+this build we invert it to fail-shut: `maybe_ping()` now returns immediately
+unless `RTK_TELEMETRY_FORCE_SEND=1` is set per-process. Result: rtk never
+contacts the network by default, regardless of config or a compiled-in URL. The
+salt/`device_hash` logic is left untouched (not changed, just never invoked).
+Files: `core/telemetry.rs`, `main.rs`.
+
+**G-2 — exit-code propagation → verified correct, no change needed.** Tested the
+built binary directly:
+
+| command | rtk exit | raw exit |
+|---------|----------|----------|
+| `rtk err "false"` | 1 | 1 |
+| `rtk err "ls /nonexistent"` (fails *with* output) | 1 | 1 |
+| `rtk test "false"` | 1 | — |
+| `rtk test "true"` | 0 | — |
+
+`run_err`/`run_test`/`summary::run` return the child's exit code and `main.rs`
+ends with `std::process::exit(code)`. The original "exit 0 on failure" scenario
+does not reproduce on current `develop` — it was already fixed upstream, which is
+why there is no commit for it in this branch.
