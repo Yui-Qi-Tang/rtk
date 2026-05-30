@@ -310,3 +310,21 @@ built binary directly:
 ends with `std::process::exit(code)`. The original "exit 0 on failure" scenario
 does not reproduce on current `develop` — it was already fixed upstream, which is
 why there is no commit for it in this branch.
+
+### Verification pass (hand-checked the audit's subagent-sourced claims)
+
+The original report was assembled partly from read-only subagents; this pass
+re-checked the load-bearing conclusions directly. Results:
+
+| Claim | Verdict |
+|-------|---------|
+| G-2 exit codes propagate | ✅ verified (ran the binary) |
+| C-1 telemetry has independent network egress, off-by-default | ✅ verified (grep + now hard-disabled) |
+| C-1 *"all payload fields are tool-names only"* | ❌ **corrected** — `low_savings_commands` sends the first 3 tokens of `rtk_cmd`, which can include args (#1785). `top_commands`/`passthrough_top` *are* tool-name-only. On this branch it's mitigated by E-1 redaction (args stripped before storage) + telemetry being off by default. |
+| A-2 no-rule → default *ask* | ✅ verified (`permissions.rs`) |
+| I-1 telemetry on `thread::spawn` fire-and-forget | ✅ verified |
+| J-1 `.semgrep.yml` rules (incl. `interpreter-execution` → `Command::new("sh")`) | ✅ verified |
+| J-2 CI security workflow (`ci.yml`) | ✅ verified |
+| D-3 trust mechanism (`rtk trust`, SHA-256 pin) present | ✅ verified (read during A/B work) |
+
+Net correction: one over-broad telemetry claim fixed. Everything else held.
