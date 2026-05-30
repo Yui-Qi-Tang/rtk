@@ -639,14 +639,14 @@ enum Commands {
         passthrough: bool,
     },
 
-    /// Trust project-local TOML filters in current directory
+    /// Trust project-local (.rtk/filters.toml) and user-global TOML filters
     Trust {
         /// List all trusted projects
         #[arg(long)]
         list: bool,
     },
 
-    /// Revoke trust for project-local TOML filters
+    /// Revoke trust for project-local and user-global TOML filters
     Untrust,
 
     /// Verify hook integrity and run TOML filter inline tests
