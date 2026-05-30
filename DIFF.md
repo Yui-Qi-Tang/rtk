@@ -1,7 +1,40 @@
 # DIFF.md — security remediation on `feature/remove_security_issue`
 
 Branch: `feature/remove_security_issue` (off `develop`). Date: 2026-05-30.
-Scope: the "core bundle" agreed up front (see [DISCOVERY.md](DISCOVERY.md) §5).
+Goal: a **security-hardened internal build** of rtk (not for upstream). Driven by
+the upstream #640 audit + DailyCVE trust finding. Detail sections below are
+chronological; this table is the at-a-glance overview.
+
+## Overview — every hardening on this branch
+
+| Area | Issue | What changed | Status |
+|------|-------|--------------|--------|
+| Local data perms | #1790 #1160 #656 | tracking DB + tee logs → `0600`/`0700` | ✅ fixed |
+| Hook flag-injection | #1350 #1770 | `--` terminator in all rewrite hooks + empty/multiline guard | ✅ fixed |
+| Tracking opt-out | #1875 | `[tracking] enabled = false` now enforced | ✅ fixed |
+| AWS secrets | #1986 #1875·1 | `secretsmanager get-secret-value` redacted by default (opt-in reveal) | ✅ fixed |
+| ANSI/OSC | #640 G-1 | `strip_ansi` also strips OSC 8 hyperlinks (URL exfil) | ✅ fixed |
+| Path traversal | #640 F-1 | `RTK_TEE_DIR` must be absolute | ✅ fixed |
+| Cmd-history secrets | #640 E-1 E-2 | `record()` redacts passwords/tokens/Authorization/URL creds before storage (covers `proxy`) | ✅ fixed |
+| Filter integrity | #640 D-2 | global `~/.config/rtk/filters.toml` now trust-gated (SHA-256), `rtk trust` covers it | ✅ fixed |
+| Filter tampering | #640 A-1 | user filters can't `replace`/`match_output` (rewrite/swallow output) — built-in only | ✅ fixed |
+| Shell injection | #640 B-1a | `err/test/summary` exec directly (no `sh -c`); refuse shell metachars/inline-env | ✅ fixed |
+| Hook auto-allow | #640 B-1b | `err/test/summary/proxy/sh` never auto-allowed — force human confirm | ✅ fixed |
+| CI trust bypass | #640 D-1 | removed `RTK_TRUST_PROJECT_FILTERS` env override entirely | ✅ fixed |
+| Env secrets | #640 E-3 | `rtk env` always masks secrets (even `--show-all`); +passwd/pwd/passphrase | ✅ fixed |
+| Audit log growth | #640 H-1 | `hook-audit.log` rotates past 5 MB | ✅ fixed |
+| Installer integrity | #640 A-4 | `install.sh` verifies `.sha256` (fail-closed) | ✅ fixed |
+| Telemetry egress | #640 C-1 | network ping hard-disabled unless `RTK_TELEMETRY_FORCE_SEND=1` | ✅ fixed |
+| Exit codes | #640 G-2 | verified already correct (no change needed) | ✓ verified |
+| Telemetry arg leak | #1785 | `low_savings_commands` still sends first 3 tokens, but secrets pre-redacted (E-1) + egress off (C-1) | ⚠️ mitigated, not isolated-fixed |
+
+**Deferred (architectural / by-design):** A-1 middle-layer trust (inherent),
+A-2 non-shell hook auto-allow (already default→ask), I-2 SQLite GLOB on Windows.
+Not tamper-proof vs a same-uid attacker (could swap the binary); filters still
+truncate (use `rtk proxy` for full output).
+
+**Quality gate (every phase):** `cargo fmt` clean · `cargo clippy --all-targets`
+0 warnings · `cargo test --all` **2000 passed / 0 failed / 7 ignored**.
 
 ## Summary
 
