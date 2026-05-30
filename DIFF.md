@@ -247,3 +247,35 @@ tamper-*evident*, but is not tamper-*proof* against an attacker with your uid
 Code hook config — OS-level controls are out of scope). Built-in filters still
 truncate, so "noise-only" is best-effort, not a guarantee — use `rtk proxy` /
 raw output when you need the complete, unfiltered result.
+
+---
+
+## Internal hardened-fork batch (B-1, D-1, E-3, H-1, A-4)
+
+Remaining #640 risks fixed for the internal security-first build.
+
+| ID | Fix | Files | Tests |
+|----|-----|-------|-------|
+| **B-1a** | `rtk err/test/summary` no longer use `sh -c`. New `build_exec_command()` tokenizes and execs directly; refuses shell metacharacters (`\| & ; > < $ \` ( ) { } * ?`) and leading inline env assignments. | `core/utils.rs`, `cmds/rust/runner.rs`, `cmds/system/summary.rs` | 3 |
+| **B-1b** | The hook never auto-allows shell-executing rtk subcommands (`err/test/summary/proxy/sh`) — they always force a human confirmation (exit 3 / ask), even if an allow rule matches. | `hooks/rewrite_cmd.rs` | 1 |
+| **D-1** | Removed the `RTK_TRUST_PROJECT_FILTERS` env override entirely (and the `TrustStatus::EnvOverride` variant). Trust is granted only via `rtk trust` — a repo's own scripts can no longer self-authorize filters. | `hooks/trust.rs`, `core/toml_filter.rs` | 1 (rewritten) |
+| **E-3** | `rtk env` always masks sensitive vars (`--show-all` no longer reveals secrets; it only un-truncates long non-sensitive values). Added `passwd`/`passphrase`/`pwd`/`session` patterns (catches `MYSQL_PWD`, `DB_PASSWD`, …). | `cmds/system/env_cmd.rs` | 1 |
+| **H-1** | `hook-audit.log` rotates to `hook-audit.log.1` once it passes 5 MB instead of growing unbounded. | `hooks/hook_cmd.rs` | 1 |
+| **A-4** | `install.sh` downloads and verifies a `.sha256` for the release tarball; fail-closed (refuses to install) unless `RTK_ALLOW_UNVERIFIED=1`. | `install.sh` | — (shell) |
+
+**Verification:** `cargo fmt` clean · `cargo clippy --all-targets` 0 warnings ·
+`cargo test --all` → **2000 passed, 0 failed, 7 ignored**.
+
+**⚠️ Behavior changes (internal fork, intentional):**
+- `rtk err/test/summary "<cmd with | && 2>&1 $() etc.>"` is now **refused** — run
+  such compound commands directly in your shell. Inline env (`FOO=bar cmd`) too.
+- `rtk test`/`rtk proxy`/`rtk sh` invocations are never auto-approved by the
+  hook — the agent will prompt for confirmation.
+- CI that relied on `RTK_TRUST_PROJECT_FILTERS=1` must now `rtk trust` the filter
+  file (or pre-populate the trust store).
+- `rtk env --show-all` no longer prints secret values.
+
+**Still deferred (architectural / by-design):** A-1 (RTK is a middle layer —
+inherent), A-2 hook auto-allow for *non-shell* rewrites (already default→ask),
+I-2 SQLite GLOB on Windows (macOS unaffected). These need design-level decisions
+rather than a localized patch.
