@@ -179,3 +179,25 @@ cargo fmt --all && cargo clippy --all-targets && cargo test --all
 PATH="$PWD/target/debug:$PATH" \
   HOOK="$PWD/hooks/claude/rtk-rewrite.sh" bash hooks/claude/test-rtk-rewrite.sh
 ```
+
+---
+
+## Follow-up fixes (from full #640 checklist review)
+
+After auditing the upstream #640 checklist (full report in
+`claudedocs/RTK-security-review-2026-05-30.md`, gitignored/local), three more
+low-risk, in-tree items were fixed on this branch:
+
+| Issue | Fix | File | Tests |
+|-------|-----|------|-------|
+| #640 G-1 | `strip_ansi` now also strips OSC sequences (BEL/ST-terminated), incl. OSC 8 hyperlinks whose embedded URLs were reaching the LLM context | `core/utils.rs` | 2 |
+| #640 F-1 | `RTK_TEE_DIR` must be an absolute path; a relative value (settable via a tool call to redirect raw output) is warned about and ignored | `core/tee.rs` | 1 |
+| #640 E-1/E-2 | `Tracker::record()` runs `redact_sensitive_args()` before persisting `original_cmd`/`rtk_cmd` — strips values after credential flags (`--password`/`--token`/…), `Authorization:` headers, sensitive `KEY=value` env, and inline URL creds (`scheme://u:p@`). Covers the `rtk proxy` path too. | `core/tracking.rs` | 2 |
+
+**Verification:** `cargo fmt` clean · `cargo clippy --all-targets` 0 warnings ·
+`cargo test --all` → **1993 passed, 0 failed, 7 ignored**.
+
+**Still NOT fixed on this branch (higher risk / upstream-coordinated):**
+B-1 `sh -c` injection (upstream PR #1194 OPEN), D-2 global-filter integrity
+(PR #1068 OPEN), D-1 CI-trust hardening, A-4 release checksum, E-3 `--show-all`
+confirm, H-1 audit-log rotation. See the review report for rationale.
