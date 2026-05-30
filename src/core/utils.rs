@@ -228,6 +228,24 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> 
     }
 }
 
+/// Restrict a file or directory to owner-only access on Unix.
+///
+/// Use `0o600` for files and `0o700` for directories that hold privacy-relevant
+/// local data (command history, raw tee output). No-op on non-Unix platforms.
+/// Best-effort: failures are ignored because the data is still written and
+/// hardening is defense-in-depth, not a correctness requirement.
+pub fn restrict_permissions(path: &std::path::Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
 /// Return the last `n` lines of output with a label, for use as a fallback
 /// when filter parsing fails. Logs a diagnostic to stderr.
 pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {

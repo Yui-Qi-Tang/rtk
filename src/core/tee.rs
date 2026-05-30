@@ -112,6 +112,9 @@ fn write_tee_file(
     max_files: usize,
 ) -> Option<PathBuf> {
     std::fs::create_dir_all(tee_dir).ok()?;
+    // Privacy hardening (#1790/#656): tee logs hold raw, unfiltered command
+    // output that can include secrets. Restrict the directory to owner-only.
+    crate::core::utils::restrict_permissions(tee_dir, 0o700);
 
     let slug = sanitize_slug(command_slug);
     let epoch = std::time::SystemTime::now()
@@ -139,6 +142,7 @@ fn write_tee_file(
     };
 
     std::fs::write(&filepath, content).ok()?;
+    crate::core::utils::restrict_permissions(&filepath, 0o600);
 
     // Rotate old files
     cleanup_old_files(tee_dir, max_files);
@@ -353,6 +357,25 @@ mod tests {
         assert!(path.exists());
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("error: test failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_tee_file_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path().join("tee");
+        let content = "secret token=abc123\n".repeat(50);
+        let result = write_tee_file(&content, "curl", &dir, DEFAULT_MAX_FILE_SIZE, 20);
+        let path = result.expect("tee file should be written");
+
+        // File must not be group/other-readable (#1790/#656).
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "tee log should be owner-only (0600)");
+
+        // Directory must be owner-only too.
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "tee dir should be owner-only (0700)");
     }
 
     #[test]
