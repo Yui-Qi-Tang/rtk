@@ -36,9 +36,18 @@ fn sanitize_slug(slug: &str) -> String {
 
 /// Get the tee directory, respecting config and env overrides.
 fn get_tee_dir(config: &Config) -> Option<PathBuf> {
-    // Env var override
+    // Env var override. Require an absolute path: a relative RTK_TEE_DIR set via
+    // a tool call could redirect raw (possibly secret-bearing) output to an
+    // unexpected location like ../../somewhere (#640 F-1). Reject and fall back.
     if let Ok(dir) = std::env::var("RTK_TEE_DIR") {
-        return Some(PathBuf::from(dir));
+        let path = PathBuf::from(&dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        eprintln!(
+            "rtk: RTK_TEE_DIR must be an absolute path, ignoring: {}",
+            dir
+        );
     }
 
     // Config override
@@ -286,6 +295,28 @@ mod tests {
         // Truncate at 40
         let long = "a".repeat(50);
         assert_eq!(sanitize_slug(&long).len(), 40);
+    }
+
+    #[test]
+    fn test_get_tee_dir_rejects_relative_env() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let config = Config::default();
+
+        std::env::set_var("RTK_TEE_DIR", "relative/evil");
+        let dir = get_tee_dir(&config);
+        std::env::remove_var("RTK_TEE_DIR");
+        assert_ne!(
+            dir,
+            Some(PathBuf::from("relative/evil")),
+            "relative RTK_TEE_DIR must be rejected"
+        );
+
+        std::env::set_var("RTK_TEE_DIR", "/tmp/rtk-tee-abs");
+        let dir2 = get_tee_dir(&config);
+        std::env::remove_var("RTK_TEE_DIR");
+        assert_eq!(dir2, Some(PathBuf::from("/tmp/rtk-tee-abs")));
     }
 
     #[test]
