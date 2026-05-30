@@ -195,8 +195,7 @@ impl TomlFilterRegistry {
                 .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
 
             match trust_status {
-                crate::hooks::trust::TrustStatus::Trusted
-                | crate::hooks::trust::TrustStatus::EnvOverride => {
+                crate::hooks::trust::TrustStatus::Trusted => {
                     if let Ok(content) = std::fs::read_to_string(project_filter_path) {
                         match Self::parse_and_compile(&content, "project", false) {
                             Ok(f) => filters.extend(f),
@@ -225,8 +224,7 @@ impl TomlFilterRegistry {
                 let trust_status = crate::hooks::trust::check_trust(&global_path)
                     .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
                 match trust_status {
-                    crate::hooks::trust::TrustStatus::Trusted
-                    | crate::hooks::trust::TrustStatus::EnvOverride => {
+                    crate::hooks::trust::TrustStatus::Trusted => {
                         if let Ok(content) = std::fs::read_to_string(&global_path) {
                             match Self::parse_and_compile(&content, "user-global", false) {
                                 Ok(f) => filters.extend(f),
@@ -623,8 +621,7 @@ pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
         let trust_status = crate::hooks::trust::check_trust(project_path)
             .unwrap_or(crate::hooks::trust::TrustStatus::Untrusted);
         match trust_status {
-            crate::hooks::trust::TrustStatus::Trusted
-            | crate::hooks::trust::TrustStatus::EnvOverride => {
+            crate::hooks::trust::TrustStatus::Trusted => {
                 if let Ok(content) = std::fs::read_to_string(project_path) {
                     collect_test_outcomes(
                         &content,

@@ -9,7 +9,7 @@
 //! - Untrusted filters are **skipped** (not "loaded with warning")
 //! - `rtk trust` stores the SHA-256 hash after user review
 //! - Content changes invalidate trust (re-review required)
-//! - `RTK_TRUST_PROJECT_FILTERS=1` overrides for CI pipelines
+//! - Trust is granted only via `rtk trust` — there is no env-var override
 
 use super::integrity;
 use crate::core::constants::{FILTERS_TOML, RTK_DATA_DIR, TRUSTED_FILTERS_JSON};
@@ -39,7 +39,6 @@ pub enum TrustStatus {
     Trusted,
     Untrusted,
     ContentChanged { expected: String, actual: String },
-    EnvOverride,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,27 +88,13 @@ fn canonical_key(filter_path: &Path) -> Result<String> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Check if a project-local filter file is trusted.
+/// Check if a filter file is trusted.
 ///
-/// Priority: env var > hash match > untrusted.
+/// Trust is granted only via `rtk trust` (SHA-256 pinning). There is no
+/// environment-variable override — a repo's own build scripts must never be
+/// able to self-authorize their filters (#640 D-1).
 /// All errors are soft — if anything fails, returns Untrusted (fail-secure).
 pub fn check_trust(filter_path: &Path) -> Result<TrustStatus> {
-    // Fast path: env var override for CI pipelines only.
-    // Requires a known CI env var to be set to prevent .envrc injection attacks.
-    if std::env::var("RTK_TRUST_PROJECT_FILTERS").as_deref() == Ok("1") {
-        let in_ci = std::env::var("CI").is_ok()
-            || std::env::var("GITHUB_ACTIONS").is_ok()
-            || std::env::var("GITLAB_CI").is_ok()
-            || std::env::var("JENKINS_URL").is_ok()
-            || std::env::var("BUILDKITE").is_ok();
-        if in_ci {
-            return Ok(TrustStatus::EnvOverride);
-        }
-        eprintln!(
-            "[rtk] WARNING: RTK_TRUST_PROJECT_FILTERS=1 ignored (CI environment not detected)"
-        );
-    }
-
     let key = canonical_key(filter_path)?;
     let store = match read_store() {
         Ok(s) => s,
@@ -334,8 +319,7 @@ mod tests {
     }
 
     fn check_trust_with_store(filter_path: &Path, store_file: &Path) -> Result<TrustStatus> {
-        // Note: env var check is NOT included here to avoid test interference.
-        // The env var path is tested separately in test_env_override.
+        // Mirrors check_trust but against an isolated store file for tests.
         let key = canonical_key(filter_path)?;
 
         let store: TrustStore = if store_file.exists() {
@@ -474,12 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn test_env_override_with_ci() {
+    fn test_env_var_no_longer_bypasses_trust() {
+        // #640 D-1: the RTK_TRUST_PROJECT_FILTERS env override was removed.
+        // Even with it (and a CI indicator) set, an unstored filter is Untrusted.
         let temp = TempDir::new().unwrap();
         let filter = temp.path().join("filters.toml");
         std::fs::write(&filter, "[filters.test]\nmatch_command = \"echo\"").unwrap();
 
-        // Both env vars must be set: trust override + CI indicator
         #[allow(deprecated)]
         std::env::set_var("RTK_TRUST_PROJECT_FILTERS", "1");
         #[allow(deprecated)]
@@ -490,22 +475,11 @@ mod tests {
         #[allow(deprecated)]
         std::env::remove_var("CI");
 
-        assert_eq!(status, TrustStatus::EnvOverride);
-    }
-
-    #[test]
-    fn test_env_override_without_ci_is_ignored() {
-        let temp = TempDir::new().unwrap();
-        let filter = temp.path().join("filters.toml");
-        std::fs::write(&filter, "[filters.test]\nmatch_command = \"echo\"").unwrap();
-        let store_file = setup_test_env(&temp);
-
-        // Trust override WITHOUT CI env → should be Untrusted, not EnvOverride
-        // (protects against .envrc injection)
-        // Note: we use check_trust_with_store which skips env var check,
-        // so this tests the store path when env var would be ignored
-        let status = check_trust_with_store(&filter, &store_file).unwrap();
-        assert_eq!(status, TrustStatus::Untrusted);
+        assert_eq!(
+            status,
+            TrustStatus::Untrusted,
+            "env var must not grant trust"
+        );
     }
 
     #[test]
