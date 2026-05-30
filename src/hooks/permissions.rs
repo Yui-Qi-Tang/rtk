@@ -695,6 +695,18 @@ mod tests {
     }
 
     #[test]
+    fn test_compound_allow_background_amp_separator() {
+        // Red-team finding: `cmd1 & cmd2` runs both, so a lone `&` must split.
+        // An allow rule for the first segment must NOT auto-allow the second.
+        let allow = vec!["gh pr *".to_string()];
+        assert_eq!(
+            check_command_with_rules("gh pr list & rm -rf ~", &[], &[], &allow),
+            PermissionVerdict::Default,
+            "background-& must not let an unlisted command ride an allow rule"
+        );
+    }
+
+    #[test]
     fn test_compound_ask_still_wins_over_partial_allow() {
         // If any segment hits an ask rule, verdict is Ask (ask > allow).
         let ask = vec!["git push".to_string()];
