@@ -31,6 +31,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use lazy_static::lazy_static;
+use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::ffi::OsString;
@@ -436,6 +438,11 @@ impl Tracker {
         };
 
         let project_path = current_project_path_string(); // added: record cwd
+
+        // Redact likely-secret values before persisting (#640 E-1/E-2): the DB
+        // is retained 90 days and replayed to the LLM via `rtk gain --history`.
+        let original_cmd = redact_sensitive_args(original_cmd);
+        let rtk_cmd = redact_sensitive_args(rtk_cmd);
 
         self.conn.execute(
             "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
@@ -1454,6 +1461,31 @@ impl TimedExecution {
     }
 }
 
+/// Redact likely-secret values from a command string before persistence (#640
+/// E-1/E-2). Conservative best-effort over four shapes: credential flags
+/// (`--password X`, `--token=X`, …), `Authorization:` headers, sensitive
+/// `KEY=value` env assignments, and inline URL credentials (`scheme://u:p@`).
+/// Never panics; returns the input unchanged when nothing matches.
+pub fn redact_sensitive_args(cmd: &str) -> String {
+    lazy_static! {
+        static ref FLAG_RE: Regex = Regex::new(
+            r"(?i)(--?(?:password|passwd|token|secret|api[-_]?key|access[-_]?key|auth[-_]?token|client[-_]?secret))([=\s]+)(\S+)"
+        ).unwrap();
+        static ref AUTH_RE: Regex =
+            Regex::new(r"(?i)(authorization:\s*(?:bearer|basic|token)\s+)([^\s'\x22]+)").unwrap();
+        static ref ENV_RE: Regex = Regex::new(
+            r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|token|secret|api[_-]?key|access[_-]?key|credential|private[_-]?key)[A-Za-z0-9_]*)=(\S+)"
+        ).unwrap();
+        static ref URL_RE: Regex =
+            Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+):([^@/\s]+)@").unwrap();
+    }
+    let s = FLAG_RE.replace_all(cmd, "${1}${2}***");
+    let s = AUTH_RE.replace_all(&s, "${1}***");
+    let s = ENV_RE.replace_all(&s, "${1}=***");
+    let s = URL_RE.replace_all(&s, "${1}:***@");
+    s.into_owned()
+}
+
 /// Format OsString args for tracking display.
 ///
 /// Joins arguments with spaces, converting each to UTF-8 (lossy).
@@ -1679,6 +1711,49 @@ mod tests {
     #[test]
     fn test_is_tracking_enabled_defaults_true() {
         assert!(is_tracking_enabled());
+    }
+
+    // Sensitive-arg redaction (#640 E-1/E-2).
+    #[test]
+    fn test_redact_sensitive_args() {
+        let r = redact_sensitive_args("psql --password hunter2 -h db");
+        assert!(!r.contains("hunter2"), "got: {r}");
+        assert!(r.contains("--password ***"), "got: {r}");
+
+        let r = redact_sensitive_args("mytool --token=abc.def.ghi run");
+        assert!(!r.contains("abc.def.ghi"), "got: {r}");
+
+        let r = redact_sensitive_args("curl -H 'Authorization: Bearer sk-secret123' https://api");
+        assert!(!r.contains("sk-secret123"), "got: {r}");
+
+        let r = redact_sensitive_args("GITHUB_TOKEN=ghp_deadbeef gh pr list");
+        assert!(!r.contains("ghp_deadbeef"), "got: {r}");
+        assert!(r.contains("GITHUB_TOKEN=***"), "got: {r}");
+
+        let r = redact_sensitive_args("git clone https://user:p4ss@github.com/o/r.git");
+        assert!(!r.contains("p4ss"), "got: {r}");
+
+        // Non-sensitive command is unchanged.
+        assert_eq!(redact_sensitive_args("git status -s"), "git status -s");
+    }
+
+    // record() must persist the REDACTED command, not the raw secret.
+    #[test]
+    fn test_record_redacts_before_storage() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        tracker
+            .record(
+                "psql --password hunter2",
+                "rtk proxy psql --password hunter2",
+                100,
+                20,
+                5,
+            )
+            .expect("record");
+        let recent = tracker.get_recent(5).expect("recent");
+        let row = recent.first().expect("one row");
+        assert!(!row.rtk_cmd.contains("hunter2"), "rtk: {}", row.rtk_cmd);
+        assert!(row.rtk_cmd.contains("***"), "rtk: {}", row.rtk_cmd);
     }
 
     // 9. project_filter_params uses GLOB pattern with * wildcard // added
