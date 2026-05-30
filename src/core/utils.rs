@@ -47,12 +47,17 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 /// ```
 pub fn strip_ansi(text: &str) -> String {
     lazy_static::lazy_static! {
-        // CSI sequences (colors/cursor) plus OSC sequences (e.g. OSC 8
-        // hyperlinks, window titles) terminated by BEL (\x07) or ST (ESC \).
-        // OSC can embed URLs, so leaving it intact would let attacker-controlled
-        // links reach the LLM context (#640 G-1).
-        static ref ANSI_RE: Regex =
-            Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)").unwrap();
+        // Strip terminal escape sequences so embedded payloads (esp. OSC 8
+        // hyperlink URLs) can't reach the LLM context (#640 G-1). Hardened
+        // after a red-team pass to also cover: unterminated OSC, OSC with an
+        // embedded ESC, the DCS/APC/PM/SOS string-escape family, and 8-bit C1
+        // controls (\x9b CSI, \x9d OSC). `(?s)` lets a string escape span to
+        // its terminator or end-of-input. Residual: a *malformed* CSI like
+        // "\x1b[38;5;http" still consumes one letter and leaves a mangled
+        // fragment — see RED_BLUE.md.
+        static ref ANSI_RE: Regex = Regex::new(
+            r"(?s)\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\|$)|\x1b[P^_X].*?(?:\x1b\\|$)|\x9b[0-9;?]*[ -/]*[@-~]|\x9d.*?(?:\x07|\x9c|$)|\x1b[@-Z\\\]^_]"
+        ).unwrap();
     }
     ANSI_RE.replace_all(text, "").to_string()
 }
@@ -560,6 +565,28 @@ mod tests {
         // OSC window-title (ST-terminated: ESC backslash).
         let input = "\x1b]0;my-secret-title\x1b\\hello";
         assert_eq!(strip_ansi(input), "hello");
+    }
+
+    #[test]
+    fn test_strip_ansi_redteam_survivors() {
+        // Red-team #640 G-1: URLs in these escapes previously survived.
+        let url = "http://EXFIL.example/PAYLOAD";
+        // 1. Unterminated OSC.
+        assert!(!strip_ansi(&format!("\x1b]8;;{url}")).contains("EXFIL"));
+        // 2. OSC 8 with an ESC embedded in the URL.
+        assert!(!strip_ansi(&format!("\x1b]8;;htt\x1bp{url}\x07")).contains("EXFIL"));
+        // 5. DCS / APC / PM / SOS string escapes.
+        for c in ['P', '_', '^', 'X'] {
+            let s = format!("\x1b{c}{url}\x1b\\");
+            assert!(!strip_ansi(&s).contains("EXFIL"), "escape {c} survived");
+        }
+        // 3. 8-bit C1 OSC (the URL is *hidden* in the OSC, so it must go).
+        assert!(!strip_ansi(&format!("\u{9d}8;;{url}\u{9c}")).contains("EXFIL"));
+        // Regression: well-formed colour codes still strip, text preserved.
+        // (A CSI-wrapped URL legitimately keeps the URL — it's visible text,
+        // not a hidden link, so that's not an exfil and not asserted here.)
+        assert_eq!(strip_ansi("\x1b[32mok\x1b[0m"), "ok");
+        assert_eq!(strip_ansi("\u{9b}32mok\u{9b}0m"), "ok");
     }
 
     #[test]
